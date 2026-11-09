@@ -28,12 +28,16 @@ topic-specific case/drug-event pairs), enter the reporting start/end dates, and 
 ## Running tests
 
 ```bash
-pytest -m "not slow" -v     # 23 unit tests, ~15s, no real files required beyond the dev fixtures
-pytest -m slow -v           # full end-to-end pipeline against real files, ~4 min
+pytest -m "not slow" -v     # 31 unit tests, ~7s, no real files required beyond the dev fixtures
+pytest -m slow -v           # full end-to-end + 22 headless frontend (AppTest) tests against real files
 ```
 
-**Test results (this environment):** 23/23 fast tests pass. The `slow` end-to-end test
-reproduces every benchmark figure in Part 6 of the original spec exactly (see below).
+**Test results (this environment):** 31/31 fast tests pass; 23/23 slow tests pass (1 full
+pipeline reproduction + 22 headless `streamlit.testing.v1.AppTest` page checks -- see
+"Independent audit and remediation pass" below). The `slow` end-to-end test reproduces
+every benchmark figure in Part 6 of the original spec exactly (see below). After the first
+run, the file-hash analysis cache (`llm/cache.py:AnalysisCache`) makes repeat slow runs
+against the same fixtures finish in under a minute instead of ~4 minutes.
 
 ---
 
@@ -41,22 +45,82 @@ reproduces every benchmark figure in Part 6 of the original spec exactly (see be
 
 | Deliverable | Status |
 |---|---|
-| Document Understanding Agent | ✅ real tool-calling loop, 9 predefined tools |
-| Excel Understanding Agent | ✅ real tool-calling loop, 9 predefined tools, parallelized across workbooks |
-| Topic Mapping Agent | ✅ tool-calling wrapper around deterministic criterion-overlap scoring |
-| Calculation Planning Agent | ✅ tool-calling wrapper around deterministic plan assembly + validation |
-| Deterministic Python calculation engine | ✅ pandas, no AI, reproduces every benchmark figure exactly |
+| Document Understanding Agent | ✅ real tool-calling loop, 10 predefined tools |
+| Excel Understanding Agent | ✅ real tool-calling loop, 10 predefined tools (incl. `detect_date_formats`), parallelized across workbooks |
+| Topic Mapping Agent | ✅ tool-calling wrapper around deterministic criterion-overlap scoring + independent all-event reconstruction/cross-validation (`processing/topic_reconstruction.py`) |
+| Calculation Planning Agent | ✅ tool-calling wrapper around deterministic plan assembly + validation, incl. join-requirements/percentage-formula documentation per step |
+| Deterministic Python calculation engine | ✅ pandas, no AI, reproduces every benchmark figure exactly, incl. serious/fatal percentages as a first-class calculated metric |
 | Configurable metric registry | ✅ `config/metric_registry.py` |
 | Dynamic schema mapping / data profiling | ✅ `tools/excel_tools.py` |
-| Validation & reconciliation | ✅ `validation/` |
+| Validation & reconciliation | ✅ `validation/` -- all 14 mandatory checks from Part 5 now formalized as `ValidationCheckResult`s in a single `ValidationReport` (`validation/input_validator.py`, `validation/mapping_validator.py`, `validation/calculation_validator.py`) |
 | AWS Bedrock integration | ⚠️ implemented, **not verified live** -- see below |
-| Cost controls / LLM-call caching | ✅ implemented (`llm/cache.py`), effectively idle since the app runs in local mode by default |
-| Streamlit frontend, 10 pages | ✅ all 10 pages implemented and headlessly tested (`streamlit.testing.v1.AppTest`) |
+| Cost controls / LLM-call caching | ✅ implemented; `llm/cache.py:AnalysisCache` now actually caches Document/Excel Agent analysis by file hash (cost-control item 6), and `PBRER_MAX_TOOL_ITERATIONS` is now wired into every agent instead of being dead config |
+| Streamlit frontend, 10 pages | ✅ all 10 pages implemented and headlessly tested (`streamlit.testing.v1.AppTest`, `tests/test_frontend_pages.py`), incl. manual topic-mapping correction/approval (`st.data_editor` + re-run) |
 | Live Agent Execution & Traceability page | ✅ reads real persisted tool-call events, never simulated |
 | Persisted structured execution logs | ✅ `observability/trace_store.py`, one JSONL per run |
 | Calculation results / audit / report-ready / benchmark workbooks | ✅ `generation/` |
-| Unit + integration tests | ✅ 23 fast + 1 slow end-to-end |
+| Unit + integration tests | ✅ 31 fast + 23 slow (1 full pipeline + 22 frontend AppTest) |
 | README / `.env.example` | ✅ this file |
+
+## Independent audit and remediation pass
+
+A follow-up audit (independent of the original build) re-verified every claim in this
+README against the actual code, rather than trusting the prose. It found the core
+architecture and benchmark reproduction were genuine, but several spec-required pieces
+were partially implemented or silently dead code. All of the following were fixed and
+re-verified against the full test suite + the real development fixtures:
+
+- **Independent topic reconstruction/cross-validation** (prompt.md Part 2 Agent 3, lines
+  378-394) did not exist at all. Added `processing/topic_reconstruction.py`: re-applies
+  each topic's own Excel search criterion to the all-drug-event workbook's MedDRA
+  columns and compares the reconstructed case set against the topic-specific export,
+  recording discrepancies rather than silently resolving them. SMQ/CMQ criteria are
+  explicitly never reconstructed (no membership column exists in a standard export).
+  Surfaced in the Validation & Audit page and as mandatory check #13.
+- **`ExecutionPlanStep.join_requirements` / `.percentage_formula`** existed in the schema
+  but were never populated. Now part of the approved `MetricDefinition` in the metric
+  registry and shown on the Calculation Review page.
+- **Serious/fatal percentages were never actually calculated** as a result at all
+  (`calculate_percentages` was imported into `pipeline.py` but never called). Added as a
+  first-class `serious_fatal_percentages` metric with its own validation check
+  (independent recomputation from the same inputs).
+- **Rule H (mismatched case/event exports)** had date/CT-filter restriction logic but no
+  check for event-workbook case IDs with no matching case record (or vice versa). Added
+  `processing.topic_reconstruction.check_case_event_population_alignment` + a formal
+  validation check.
+- **Validation module** only had 2 of the 3 planned files and formalized 5 of the 14
+  mandatory checks from Part 5. Added `validation/input_validator.py` (checks #1-4:
+  input files present, workbook/sheet identification, header detection, footer
+  detection) and `validation/mapping_validator.py` (checks #8, #12, #13), plus checks
+  #10 (seriousness/death category sanity) and #11 (percentage recomputation) in
+  `calculation_validator.py`. `assemble_validation_report()` now actually builds the
+  `ValidationReport` schema that previously existed but was never constructed.
+- **`detect_date_formats`** (one of the 11 Excel-agent tools required by Part 2) was
+  defined but never invoked by anything. Wired into the per-workbook investigation loop
+  to independently validate the mapped initial-approval-date column's format -- which
+  also surfaced a real bug (it only recognized raw Python `int`/`float` inputs, but
+  every real caller passes already-stringified profile samples) that's now fixed.
+- **Topic Mapping page had no manual correction/approval** (prompt.md line 881) --
+  only a read-only table. Added an `st.data_editor` with per-row workbook
+  reassignment/approval and an "Apply corrections and re-run calculations" action that
+  re-runs the Calculation Planning Agent + calculation engine + validation without
+  re-running the (unchanged) Document/Excel Understanding Agents.
+- **`PBRER_MAX_TOOL_ITERATIONS`** was defined in settings but never read by any agent
+  (each one hardcoded its own iteration cap). Now every agent defaults to this setting.
+- **`file_hash()`-based analysis caching** (cost-control item 6) existed as a helper
+  function but was never called. Added `llm/cache.py:AnalysisCache` and wired it into
+  both the Document and Excel Understanding Agents, keyed on file content hash + config
+  version -- a second run against byte-identical inputs skips the agent loop entirely.
+- A real correctness bug surfaced while building the reconstruction feature: the
+  general-purpose prose term-splitter (`tools.topic_tools.extract_criterion_terms`)
+  treats `" and "` as a conjunction between two criteria, which would silently fragment
+  a genuine MedDRA term like "Confusion and disorientation" into two bogus terms when
+  applied to the Excel's own exact criterion value. Added a separate exact-match
+  splitter, `extract_excel_criterion_terms`, used only by the reconstruction path.
+
+Everything above is covered by new tests (`tests/test_topic_reconstruction.py`,
+`tests/test_date_format_tool_wiring.py`, `tests/test_frontend_pages.py`) and the full
+suite (54 tests) passes, including the real end-to-end benchmark reproduction.
 
 ## Which agents actually use LLM tool-calling, and in which mode
 
@@ -88,14 +152,20 @@ and records the real result. Two providers exist (`llm/provider.py`):
   `extract_topic_subtree`, `extract_tables_near_heading`, `parse_topic_historical_metrics`.
 - **Excel Understanding Agent** (`tools/excel_tools.py`, openpyxl + pandas): `discover_excel_files`,
   `inspect_workbook`, `inspect_sheet`, `detect_header_row`, `detect_data_region`,
-  `detect_footer_rows`, `profile_columns`, `extract_cover_page_criteria`,
-  `classify_workbook`, `map_columns_to_schema`, `match_workbooks`.
+  `detect_footer_rows`, `profile_columns`, `detect_date_formats`, `extract_cover_page_criteria`,
+  `classify_workbook`, `map_columns_to_schema`. `match_workbooks` is also a predefined
+  Python tool but runs once across all per-workbook results (cross-workbook pairing
+  isn't a per-workbook investigation step) rather than through the same per-workbook
+  ToolSpec loop.
 - **Topic Mapping Agent** (`tools/topic_tools.py`): `match_topics_to_workbooks`
   (term-overlap scoring between the PBRER's prose criteria and the Excel cover
-  page's own criterion value).
+  page's own criterion value). Independent reconstruction/cross-validation against the
+  all-drug-event workbook (`processing/topic_reconstruction.py`) runs as a separate,
+  deterministic step in the pipeline, not through this agent's tool-calling loop --
+  consistent with Part 3's "deterministic calculation engine" being pure pandas.
 - **Calculation Planning Agent** (`tools/plan_tools.py`): `build_execution_plan`
-  (assembles + validates steps against `config/metric_registry.py`; never invents a
-  business rule).
+  (assembles + validates steps -- including join requirements and percentage formulas --
+  against `config/metric_registry.py`; never invents a business rule).
 
 ## What's deterministic, not AI-driven
 

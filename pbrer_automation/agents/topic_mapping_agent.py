@@ -42,10 +42,12 @@ TOPIC_MAPPING_SYSTEM_PROMPT = (
 class TopicMappingAgent:
     agent_name = "topic_mapping_agent"
 
-    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int = 5):
+    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None):
+        from config.settings import settings
+
         self.tool_specs = build_topic_tool_specs()
         self.trace_sink = trace_sink
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self._provider_factory = provider_factory
 
     def run(self, run_id: str, document_structure: DocumentStructure,

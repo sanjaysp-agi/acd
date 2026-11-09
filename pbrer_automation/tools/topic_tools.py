@@ -41,6 +41,29 @@ def extract_criterion_terms(text: str | None) -> list[str]:
     return terms
 
 
+def extract_excel_criterion_terms(excel_criterion_value: str | None) -> list[str]:
+    """Split an Excel cover-page criterion VALUE (already a clean,
+    comma-separated list of exact MedDRA terms, e.g. 'Hallucinations
+    (excl sleep-related), Confusion and disorientation') into individual
+    terms for EXACT matching against a MedDRA classification column
+    (processing.topic_reconstruction).
+
+    Deliberately simpler than extract_criterion_terms above: this does
+    NOT treat the word 'and' as a conjunction between two separate
+    criteria -- a real MedDRA HLT can itself contain the word 'and'
+    (e.g. 'Confusion and disorientation'), and extract_criterion_terms'
+    "\\s+and\\s+" -> ";" rule (tuned for scoring loosely-worded PROSE
+    document text, where some over-splitting only costs Jaccard-score
+    precision) would silently fragment that single term into two and
+    make exact reconstruction undercount real matching rows."""
+    if not excel_criterion_value:
+        return []
+    cleaned = excel_criterion_value.replace('"', "").replace("'", "").replace("‘", "").replace("’", "")
+    cleaned = cleaned.replace("“", "").replace("”", "")
+    parts = cleaned.split(",")
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
 def score_topic_workbook_match(doc_search_criteria_text: str | None, excel_criterion_value: str | None) -> dict[str, Any]:
     """Jaccard-style overlap between the term set implied by the
     document's prose criteria and the Excel cover page's own criterion

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import ToolCallingAgent
-from config.metric_registry import CriterionType, DataGrain, WorkbookType
+from config.metric_registry import CanonicalField, CriterionType, DataGrain, WorkbookType
 from llm.local_provider import LocalDeterministicProvider
 from llm.provider import AgentStep, ToolSpec
 from models.schemas import (
@@ -192,6 +192,46 @@ class _WorkbookPolicyState:
                 detection_evidence=[f"header_row={self.current_header_row}"],
             )
             self._column_mappings = mappings
+
+            # Part 3 Rule A: the column mapped onto the canonical reporting-date
+            # field is the one that actually drives every downstream reporting-
+            # period filter, so its detected format is independently re-validated
+            # with the dedicated detect_date_formats tool (not just the inline
+            # guess made inside profile_columns) -- an ambiguous result is
+            # surfaced as a warning requiring review rather than silently trusted.
+            date_mapping = next((m for m in mappings
+                                  if m.get("canonical_field") == CanonicalField.INITIAL_APPROVAL_DATE.value), None)
+            if date_mapping:
+                profile = next((p for p in self.current_profiles if p["column_name"] == date_mapping["raw_column"]), None)
+                if profile is not None:
+                    self._pending_date_mapping = date_mapping
+                    self.phase = "awaiting_date_format_detection"
+                    return AgentStep(type="call_tool", tool_name="detect_date_formats",
+                                      arguments={"sample_values": profile.get("sample_values", [])},
+                                      rationale=f"Independently validating the detected date format for the "
+                                                f"mapped initial-approval-date column '{date_mapping['raw_column']}'.")
+            return self._advance_to_next_sheet()
+
+        if self.phase == "awaiting_date_format_detection":
+            detection = last_result or {}
+            date_mapping = getattr(self, "_pending_date_mapping", None)
+            sheet = self.sheet_results.get(self.current_sheet)
+            if sheet and date_mapping:
+                for p in sheet.column_profiles:
+                    if p.column_name == date_mapping["raw_column"] and detection.get("format"):
+                        p.possible_date_format = detection["format"]
+                        break
+                sheet.detection_evidence.append(
+                    f"detect_date_formats({date_mapping['raw_column']})={detection.get('format')} "
+                    f"(confidence {detection.get('confidence', 0):.2f})")
+            if detection.get("confidence", 1.0) < 0.6:
+                self.warnings.append(AgentWarning(
+                    code="ambiguous_date_format",
+                    message=f"Date column '{date_mapping['raw_column'] if date_mapping else '?'}' in "
+                            f"{self.current_sheet} ({self.file_name}) has an ambiguous detected format "
+                            f"({detection.get('format')}, confidence {detection.get('confidence')}) -- requires review.",
+                    severity="warning",
+                ))
             return self._advance_to_next_sheet()
 
         return self._finalize()
@@ -254,6 +294,10 @@ def build_excel_tool_specs() -> list[ToolSpec]:
                  {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"},
                                                      "header_row": {"type": "integer"}, "data_end_row": {"type": ["integer", "null"]}}},
                  et.profile_columns, "pandas"),
+        ToolSpec("detect_date_formats", "Independently determine the likely date format for a candidate "
+                 "date column from its raw sample values.",
+                 {"type": "object", "properties": {"sample_values": {"type": "array"}}},
+                 et.detect_date_formats, "pandas"),
         ToolSpec("extract_cover_page_criteria", "Scan a cover-page sheet for label:value search criteria.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"}}},
                  et.extract_cover_page_criteria, "openpyxl"),
@@ -278,10 +322,12 @@ EXCEL_AGENT_SYSTEM_PROMPT = (
 class ExcelUnderstandingAgent:
     agent_name = "excel_understanding_agent"
 
-    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int = 12, max_workers: int = 10):
+    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None, max_workers: int = 10):
+        from config.settings import settings
+
         self.tool_specs = build_excel_tool_specs()
         self.trace_sink = trace_sink
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self.max_workers = max_workers
         self._provider_factory = provider_factory  # callable(policy) -> ToolCallingProvider
         self._trace_lock = threading.Lock()
@@ -305,6 +351,22 @@ class ExcelUnderstandingAgent:
         return runner
 
     def investigate_workbook(self, run_id: str, file_path: str, file_name: str) -> dict[str, Any]:
+        from config.settings import settings
+        from llm.cache import AnalysisCache
+
+        cache = AnalysisCache() if settings.llm.enable_cache else None
+        if cache is not None:
+            cached_entry = cache.get("workbook", file_path)
+            if cached_entry is not None:
+                cached_entry["file_path"] = file_path  # current run's path, not whatever cached it
+                self._thread_safe_trace_sink({
+                    "run_id": run_id, "timestamp": datetime.now(UTC), "agent_name": self.agent_name,
+                    "event_type": "analysis_cache_hit", "status": "info",
+                    "message": f"Workbook analysis cache hit for '{file_name}' (unchanged file content) "
+                                "-- skipped re-running the per-workbook investigation loop.",
+                })
+                return {"agent_result": None, "entry": cached_entry}
+
         state = _WorkbookPolicyState(file_path, file_name)
 
         def policy(conversation, tools):
@@ -319,7 +381,10 @@ class ExcelUnderstandingAgent:
         runner = self._make_runner(policy)
         result = runner.run(run_id, EXCEL_AGENT_SYSTEM_PROMPT,
                              f"Investigate workbook: {file_name}")
-        return {"agent_result": result, "entry": result.output.get("entry")}
+        entry = result.output.get("entry")
+        if cache is not None and entry is not None:
+            cache.put("workbook", file_path, entry)
+        return {"agent_result": result, "entry": entry}
 
     def run(self, run_id: str, input_dir: str | Path) -> WorkbookInventory:
         files = et.discover_excel_files(input_dir)

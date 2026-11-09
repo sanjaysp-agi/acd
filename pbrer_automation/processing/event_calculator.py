@@ -28,6 +28,11 @@ def compute_eligible_events(df: pd.DataFrame, case_id_column: str, date_column: 
     period = filter_by_reporting_period(df, date_column, reporting_start, reporting_end, date_format_hint)
     ct = apply_clinical_trials_exclusion(period["filtered_df"], primary_source_column)
     eligible_df = ct["filtered_df"]
+    # Captured BEFORE the eligible-case-set restriction below, so callers
+    # can independently check for mismatched case/event exports (Part 3
+    # Rule H: "Case IDs with no matching case record") -- restricting
+    # first would make that comparison vacuous.
+    case_ids_before_restriction = set(eligible_df[case_id_column].dropna().unique())
 
     rows_outside_case_set = 0
     if eligible_case_ids is not None:
@@ -43,6 +48,7 @@ def compute_eligible_events(df: pd.DataFrame, case_id_column: str, date_column: 
         "clinical_trial_values_matched": ct["matched_source_values"],
         "rows_outside_eligible_case_set": rows_outside_case_set,
         "rows_after_filter": len(eligible_df),
+        "case_ids_before_case_set_restriction": case_ids_before_restriction,
     }
 
 

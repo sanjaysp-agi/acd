@@ -84,7 +84,7 @@ def build_execution_plan(document_topics: list[dict[str, Any]], workbook_entries
         event_sheet = _find_data_sheet(event_wb)
         event_mapped = _mapped_columns(event_wb)
 
-        for metric_id in ("serious_case_count", "fatal_case_count", "event_pt_frequency"):
+        for metric_id in ("serious_case_count", "fatal_case_count", "event_pt_frequency", "serious_fatal_percentages"):
             metric_def = METRIC_REGISTRY[metric_id]
             valid, missing = _validate_required_fields([f.value for f in metric_def.required_fields], event_mapped)
             steps.append(_make_step(metric_id, mapping.get("pbrer_section_number"), mapping.get("pbrer_heading"),
@@ -113,6 +113,8 @@ def _make_step(metric_id: str, section_number: str | None, heading: str | None, 
         "applies_clinical_trials_exclusion": True,
         "grain": metric_def.grain.value,
         "distinct_by": metric_def.distinct_by.value if metric_def.distinct_by else None,
+        "join_requirements": metric_def.join_requirements,
+        "percentage_formula": metric_def.percentage_formula,
         "validated": valid,
         "validation_notes": [] if valid else [f"Missing required canonical field mapping(s): {missing}"],
         "header_row": sheet.get("header_row") if sheet else None,

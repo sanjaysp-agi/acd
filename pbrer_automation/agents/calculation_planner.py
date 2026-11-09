@@ -44,10 +44,12 @@ PLANNER_SYSTEM_PROMPT = (
 class CalculationPlanningAgent:
     agent_name = "calculation_planning_agent"
 
-    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int = 5):
+    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None):
+        from config.settings import settings
+
         self.tool_specs = build_plan_tool_specs()
         self.trace_sink = trace_sink
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self._provider_factory = provider_factory
 
     def run(self, run_id: str, document_topics: list[dict], workbook_inventory: WorkbookInventory,
@@ -87,6 +89,7 @@ class CalculationPlanningAgent:
                 date_format=s.get("date_format"), reporting_start=s["reporting_start"],
                 reporting_end=s["reporting_end"], applies_clinical_trials_exclusion=True,
                 grain=DataGrain(s["grain"]), distinct_by=CanonicalField(s["distinct_by"]) if s.get("distinct_by") else None,
+                join_requirements=s.get("join_requirements"), percentage_formula=s.get("percentage_formula"),
                 header_row=s.get("header_row"), data_end_row=s.get("data_end_row"),
                 validated=s.get("validated", False), validation_notes=s.get("validation_notes", []),
             ))

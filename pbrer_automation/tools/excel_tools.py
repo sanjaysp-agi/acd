@@ -471,10 +471,17 @@ def detect_date_formats(sample_values: list[Any]) -> dict[str, Any]:
         return {"format": None, "confidence": 0.0}
 
     def looks_like_yyyymmdd_int(v: Any) -> bool:
-        s = str(v).rstrip(".0") if isinstance(v, float) else str(v)
+        # Accepts raw ints/floats AND their stringified form -- callers
+        # profiling a column (tools.excel_tools.profile_columns) always
+        # stringify sample values before this function ever sees them
+        # (ColumnProfile.sample_values is list[str]), so matching only
+        # true Python int/float instances would never fire in practice.
+        s = str(v)
+        if s.endswith(".0"):
+            s = s[:-2]
         return bool(re.match(r"^\d{8}$", s)) and 1900 <= int(s[:4]) <= 2100
 
-    if all(isinstance(v, (int, float)) and looks_like_yyyymmdd_int(v) for v in non_null):
+    if all(looks_like_yyyymmdd_int(v) for v in non_null):
         return {"format": "YYYYMMDD_numeric", "confidence": 0.95}
 
     try:

@@ -79,6 +79,7 @@ def calculate_topic_event_metrics(event_file_path: str, event_sheet: str, event_
         "fatal_event_row_count": fatal["fatal_event_row_count"],
         "fatal_case_count": fatal["fatal_distinct_case_count"],
         "event_pt_frequency": pt_freq,
+        "event_case_ids_before_restriction": eligibility["case_ids_before_case_set_restriction"],
         "evidence": {
             "rows_before_filter": eligibility["rows_before_filter"],
             "rows_in_period": eligibility["rows_in_period"],
@@ -86,6 +87,12 @@ def calculate_topic_event_metrics(event_file_path: str, event_sheet: str, event_
             "clinical_trial_values_matched": eligibility["clinical_trial_values_matched"],
             "rows_outside_eligible_case_set": eligibility["rows_outside_eligible_case_set"],
             "rows_after_filter": eligibility["rows_after_filter"],
+            # Mandatory check #10 (prompt.md Part 5): every distinct raw value actually
+            # observed in the seriousness/death columns, so an unrecognized category
+            # (misspelling, new export value) surfaces for review instead of silently
+            # being treated as "No".
+            "event_seriousness_unique_values": sorted(str(v) for v in eligible_df[event_seriousness_col].dropna().unique())[:20],
+            "event_death_unique_values": sorted(str(v) for v in eligible_df[event_death_col].dropna().unique())[:20],
         },
     }
 

@@ -47,7 +47,13 @@ class LLMSettings:
     bedrock_model_id: str = os.environ.get(
         "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"
     )
-    max_tool_iterations: int = _env_int("PBRER_MAX_TOOL_ITERATIONS", 8)
+    # Safety ceiling on tool-calling round trips within a SINGLE agent run
+    # (prompt.md Part 8) -- not a tight per-run budget (that's
+    # max_invocations_per_run below); sized generously enough that the
+    # Document Agent's paragraph-by-paragraph investigation of a large
+    # PBRER never hits it in normal operation, while still guaranteeing a
+    # runaway tool-calling loop terminates rather than running unbounded.
+    max_tool_iterations: int = _env_int("PBRER_MAX_TOOL_ITERATIONS", 200)
     max_invocations_per_run: int = _env_int("PBRER_MAX_INVOCATIONS_PER_RUN", 40)
     max_output_tokens: int = _env_int("PBRER_MAX_OUTPUT_TOKENS", 2048)
     temperature: float = 0.0

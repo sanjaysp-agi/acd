@@ -258,13 +258,33 @@ class _DocumentPolicyState:
 class DocumentUnderstandingAgent:
     agent_name = "document_understanding_agent"
 
-    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int = 200):
+    def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None):
+        from config.settings import settings
+
         self.tool_specs = build_document_tool_specs()
         self.trace_sink = trace_sink
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self._provider_factory = provider_factory
 
     def run(self, run_id: str, file_path: str | Path) -> DocumentStructure:
+        from config.settings import settings
+        from llm.cache import AnalysisCache
+
+        cache = AnalysisCache() if settings.llm.enable_cache else None
+        if cache is not None:
+            cached = cache.get("document", file_path)
+            if cached is not None:
+                cached["run_id"] = run_id
+                cached["generated_at"] = datetime.now(UTC).isoformat()
+                if self.trace_sink:
+                    self.trace_sink({
+                        "run_id": run_id, "timestamp": datetime.now(UTC), "agent_name": self.agent_name,
+                        "event_type": "analysis_cache_hit", "status": "info",
+                        "message": f"Document analysis cache hit for '{Path(file_path).name}' (unchanged file "
+                                    "content) -- skipped re-running the tool-calling loop.",
+                    })
+                return DocumentStructure.model_validate(cached)
+
         state = _DocumentPolicyState(str(file_path))
 
         def policy(conversation, tools):
@@ -288,5 +308,7 @@ class DocumentUnderstandingAgent:
                 warnings=[AgentWarning(code="agent_failed", severity="critical",
                                         message="Document Understanding Agent did not reach a final answer.")],
             )
+        if cache is not None:
+            cache.put("document", file_path, structure_dict)
         structure_dict["run_id"] = run_id
         return DocumentStructure.model_validate(structure_dict)

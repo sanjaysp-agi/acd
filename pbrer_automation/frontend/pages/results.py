@@ -24,7 +24,12 @@ def render():
         cols = st.columns(len(metrics))
         for col, mr in zip(cols, metrics):
             value = mr.calculated_value
-            display_value = value if isinstance(value, (int, float, str)) else f"{len(value)} items" if value else "—"
+            if mr.metric_id == "serious_fatal_percentages" and isinstance(value, dict):
+                display_value = f"serious {value.get('serious_pct')}% / fatal {value.get('fatal_pct')}%"
+            elif isinstance(value, (int, float, str)):
+                display_value = value
+            else:
+                display_value = f"{len(value)} items" if value else "—"
             delta = None
             if mr.historical_value is not None and isinstance(value, (int, float)):
                 delta = f"{mr.difference:+} vs historical {mr.historical_value}"

@@ -170,6 +170,11 @@ class MetricDefinition:
     # fixed (CLINICAL_TRIALS_EXCLUSION_ENABLED) and applied by
     # processing/source_filter.py to every metric whose required_fields
     # include PRIMARY_SOURCE. No metric can opt out.
+    # Approved, human-readable join and percentage-formula documentation
+    # (prompt.md Part 2/Agent 4, lines 428-429) -- part of the controlled
+    # metric definition, never invented per-run by an agent.
+    join_requirements: str = "None -- single workbook, no cross-file join required."
+    percentage_formula: str | None = None
 
 
 METRIC_REGISTRY: dict[str, MetricDefinition] = {
@@ -181,6 +186,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         grain=DataGrain.ONE_ROW_PER_CASE,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.INITIAL_APPROVAL_DATE,
                           CanonicalField.PRIMARY_SOURCE),
+        join_requirements="None -- case-level grain, one row per Case Number in this workbook.",
     ),
     "total_case_count": MetricDefinition(
         metric_id="total_case_count",
@@ -190,6 +196,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         grain=DataGrain.ONE_ROW_PER_CASE,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.INITIAL_APPROVAL_DATE,
                           CanonicalField.PRIMARY_SOURCE),
+        join_requirements="None -- case-level grain, one row per Case Number in this workbook.",
     ),
     "source_breakdown": MetricDefinition(
         metric_id="source_breakdown",
@@ -197,6 +204,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         source_workbook_type=WorkbookType.TOPIC_CASE,
         grain=DataGrain.ONE_ROW_PER_CASE,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.PRIMARY_SOURCE),
+        join_requirements="None -- grouping only, same eligible case set as topic_case_count.",
     ),
     "serious_case_count": MetricDefinition(
         metric_id="serious_case_count",
@@ -206,6 +214,12 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         source_workbook_type=WorkbookType.TOPIC_DRUG_EVENT,
         grain=DataGrain.ONE_ROW_PER_CASE_EVENT,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.EVENT_SERIOUSNESS),
+        join_requirements="Inner-restrict the topic drug-event workbook's Case Number to the "
+        "eligible Case Number set already established from the topic case workbook "
+        "(date + Clinical Trials filters applied there) -- event rows for a case the "
+        "case file excluded are dropped before counting.",
+        percentage_formula="serious_case_count / topic_case_count * 100, rounded to "
+        "PBRER_ROUNDING_DECIMALS.",
     ),
     "fatal_case_count": MetricDefinition(
         metric_id="fatal_case_count",
@@ -214,6 +228,10 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         source_workbook_type=WorkbookType.TOPIC_DRUG_EVENT,
         grain=DataGrain.ONE_ROW_PER_CASE_EVENT,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.EVENT_DEATH),
+        join_requirements="Same eligible-case-set restriction as serious_case_count "
+        "(topic case workbook's Case Number set).",
+        percentage_formula="fatal_case_count / topic_case_count * 100, rounded to "
+        "PBRER_ROUNDING_DECIMALS.",
     ),
     "event_pt_frequency": MetricDefinition(
         metric_id="event_pt_frequency",
@@ -223,6 +241,22 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         grain=DataGrain.ONE_ROW_PER_CASE_EVENT,
         required_fields=(CanonicalField.CASE_ID, CanonicalField.EVENT_PT),
         distinct_by=None,
+        join_requirements="Same eligible-case-set restriction as serious_case_count "
+        "(topic case workbook's Case Number set).",
+    ),
+    "serious_fatal_percentages": MetricDefinition(
+        metric_id="serious_fatal_percentages",
+        description="Serious and fatal distinct-case percentages relative to the topic case count "
+        "(Part 3 Rule I).",
+        source_workbook_type=WorkbookType.TOPIC_DRUG_EVENT,
+        grain=DataGrain.ONE_ROW_PER_CASE_EVENT,
+        required_fields=(CanonicalField.CASE_ID, CanonicalField.EVENT_SERIOUSNESS, CanonicalField.EVENT_DEATH),
+        distinct_by=None,
+        join_requirements="Same eligible-case-set restriction as serious_case_count/fatal_case_count; "
+        "denominator is the topic case workbook's distinct case count.",
+        percentage_formula="serious_pct = serious_case_count / topic_case_count * 100; "
+        "fatal_pct = fatal_case_count / topic_case_count * 100. Both rounded to "
+        "PBRER_ROUNDING_DECIMALS.",
     ),
 }
 

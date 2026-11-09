@@ -9,10 +9,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from models.schemas import CalculationEvidence, MetricResult, ValidationCheckResult
+from config.metric_registry import KNOWN_NON_AFFIRMATIVE_CATEGORIES, normalize_flag_value
+from models.schemas import CalculationEvidence, MetricResult, ValidationCheckResult, ValidationReport
+
+_RECOGNIZED_FLAG_CATEGORIES = KNOWN_NON_AFFIRMATIVE_CATEGORIES | {"yes"}
 
 
-def run_mandatory_checks(step_validated: bool, evidence: dict[str, Any]) -> list[ValidationCheckResult]:
+def run_mandatory_checks(step_validated: bool, evidence: dict[str, Any], metric_id: str | None = None,
+                           calculated_value: Any = None) -> list[ValidationCheckResult]:
     checks = []
 
     checks.append(ValidationCheckResult(
@@ -58,6 +62,52 @@ def run_mandatory_checks(step_validated: bool, evidence: dict[str, Any]) -> list
                     else "No rows matched the Clinical Trials pattern in this dataset.",
         ))
 
+    # Mandatory check #10: seriousness/death classification sanity. Every
+    # distinct raw value observed in the seriousness/death columns must
+    # normalize to a recognized category -- an unrecognized value (typo,
+    # new export category) must be flagged, never silently treated as "No".
+    seriousness_values = evidence.get("event_seriousness_unique_values")
+    death_values = evidence.get("event_death_unique_values")
+    if seriousness_values is not None or death_values is not None:
+        unrecognized = sorted({
+            v for v in (seriousness_values or []) + (death_values or [])
+            if normalize_flag_value(v) not in _RECOGNIZED_FLAG_CATEGORIES
+        })
+        checks.append(ValidationCheckResult(
+            check_name="seriousness_death_classification",
+            status="pass" if not unrecognized else "warning",
+            message="All observed seriousness/death values normalize to a recognized category."
+                    if not unrecognized else
+                    f"Unrecognized seriousness/death category value(s) observed: {unrecognized}.",
+            evidence={"event_seriousness_unique_values": seriousness_values,
+                       "event_death_unique_values": death_values, "unrecognized": unrecognized},
+        ))
+
+    # Mandatory check #11: percentage calculation validation -- independently
+    # recompute the percentage from the same inputs the metric result itself
+    # reports, so a rounding/denominator bug surfaces as a formal failure
+    # rather than only being visible by eyeballing the Results page.
+    if metric_id == "serious_fatal_percentages" and isinstance(calculated_value, dict):
+        from processing.event_calculator import compute_percentage
+
+        serious_count = evidence.get("serious_case_count")
+        fatal_count = evidence.get("fatal_case_count")
+        topic_count = evidence.get("topic_case_count")
+        decimals = evidence.get("rounding_decimals", 1)
+        recomputed = {
+            "serious_pct": compute_percentage(serious_count, topic_count, decimals) if topic_count is not None else None,
+            "fatal_pct": compute_percentage(fatal_count, topic_count, decimals) if topic_count is not None else None,
+        }
+        ok = recomputed == calculated_value
+        checks.append(ValidationCheckResult(
+            check_name="percentage_calculation",
+            status="pass" if ok else "fail",
+            message="Reported serious/fatal percentages match independent recomputation from the "
+                    "same case counts." if ok else
+                    "Percentage calculation mismatch between the reported value and independent recomputation.",
+            evidence={"reported": calculated_value, "recomputed": recomputed},
+        ))
+
     return checks
 
 
@@ -67,7 +117,7 @@ def build_metric_result(metric_id: str, pbrer_section_number: str | None, topic_
                           date_format: str | None, reporting_start: str, reporting_end: str,
                           evidence: dict[str, Any], calculation_function: str,
                           step_validated: bool, historical_value: Any = None) -> MetricResult:
-    checks = run_mandatory_checks(step_validated, evidence)
+    checks = run_mandatory_checks(step_validated, evidence, metric_id=metric_id, calculated_value=calculated_value)
     critical_failures = [c for c in checks if c.status == "fail"]
 
     difference = None
@@ -85,7 +135,7 @@ def build_metric_result(metric_id: str, pbrer_section_number: str | None, topic_
         distinct_case_count=evidence.get("distinct_case_count"),
         event_row_count=evidence.get("event_row_count"),
         calculation_function=calculation_function,
-        extra=evidence,
+        extra={**evidence, "mandatory_checks": [c.model_dump(mode="json") for c in checks]},
     )
 
     status = "verified"
@@ -100,3 +150,27 @@ def build_metric_result(metric_id: str, pbrer_section_number: str | None, topic_
         evidence=calc_evidence, validation_status=status,
         validation_messages=[c.message for c in checks],
     )
+
+
+def assemble_validation_report(run_id: str, metric_results: list[MetricResult],
+                                  extra_checks: list[ValidationCheckResult]) -> ValidationReport:
+    """Builds the single, structured ValidationReport (prompt.md Part 5)
+    combining every per-metric mandatory check already embedded in each
+    MetricResult's evidence with the input/workbook/mapping-level checks
+    computed outside the per-metric loop (checks #1-4, #8, #12, #13)."""
+    from datetime import datetime, UTC
+
+    all_checks: list[ValidationCheckResult] = []
+    for mr in metric_results:
+        for c in mr.evidence.extra.get("mandatory_checks", []):
+            all_checks.append(ValidationCheckResult.model_validate(c))
+    all_checks.extend(extra_checks)
+
+    overall = "verified"
+    if any(c.status == "fail" for c in all_checks) or any(mr.validation_status == "failed" for mr in metric_results):
+        overall = "failed"
+    elif any(c.status == "warning" for c in all_checks) or any(mr.validation_status == "warning" for mr in metric_results):
+        overall = "warning"
+
+    return ValidationReport(run_id=run_id, generated_at=datetime.now(UTC), checks=all_checks,
+                              metric_results=metric_results, overall_status=overall)

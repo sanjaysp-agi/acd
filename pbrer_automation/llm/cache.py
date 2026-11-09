@@ -56,3 +56,31 @@ def file_hash(file_path: str | Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+class AnalysisCache:
+    """File-hash-keyed cache for a whole agent analysis result (prompt.md
+    Part 8 cost-control item 6). Keyed on content hash + CONFIG_VERSION, so
+    re-running the app against byte-identical inputs skips the agent's
+    tool-calling loop (and every LLM call it would have made) entirely,
+    rather than only de-duplicating individual LLM calls. Any change to
+    the file's bytes, or a bump of CONFIG_VERSION after a detector/prompt
+    change, invalidates the cache automatically."""
+
+    def __init__(self, cache_dir: Path = CACHE_DIR / "analysis"):
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, kind: str, file_path: str | Path) -> Path:
+        key = f"{kind}_{file_hash(file_path)}_{CONFIG_VERSION}"
+        return self.cache_dir / f"{key}.json"
+
+    def get(self, kind: str, file_path: str | Path) -> dict[str, Any] | None:
+        path = self._path(kind, file_path)
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return None
+
+    def put(self, kind: str, file_path: str | Path, result: dict[str, Any]) -> None:
+        path = self._path(kind, file_path)
+        path.write_text(json.dumps(result, default=str), encoding="utf-8")

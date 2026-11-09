@@ -259,6 +259,24 @@ class BenchmarkReport(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Independent topic reconstruction / cross-validation (prompt.md Part 2
+# Agent 3 lines 378-394; Part 5 mandatory check #13)
+# ---------------------------------------------------------------------------
+class TopicReconstructionResult(BaseModel):
+    pbrer_section_number: str | None
+    topic_heading: str
+    feasible: bool
+    reason: str = ""
+    criterion_type: CriterionType = CriterionType.UNKNOWN
+    criterion_value: str | None = None
+    reconstructed_case_count: int | None = None
+    reconstructed_event_row_count: int | None = None
+    topic_export_case_count: int | None = None
+    comparison: dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Traceability / observability
 # ---------------------------------------------------------------------------
 class TraceEvent(BaseModel):
