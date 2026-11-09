@@ -1,7 +1,4 @@
 # MASTER PROMPT: BUILD AN AI-DRIVEN PBRER SECTION 16.3 AUTOMATION POC
-
-Act as a senior AI engineer, Python architect, pharmacovigilance data analyst and full-stack developer.
-
 Your task is to build a complete, runnable Proof of Concept (POC) for an AI-driven system that automates the extraction, calculation and validation of numerical information required for Section 16.3 of a PBRER (Periodic Benefit-Risk Evaluation Report).
 
 I do not want just an architecture, explanation, project skeleton or code snippets. I want an actual working application with:

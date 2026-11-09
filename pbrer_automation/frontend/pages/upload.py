@@ -6,26 +6,48 @@ AWS/Bedrock configuration exposed here.
 """
 from __future__ import annotations
 
-import shutil
+import tempfile
 import uuid
 from datetime import date
 from pathlib import Path
 
 import streamlit as st
 
-from config.settings import DATA_DIR
 from observability.run_manager import execute_run
+
+# Windows MAX_PATH is 260 chars. These CSMR export filenames are long on
+# their own (e.g. "02_drugevent_Impulse control disorders such as
+# compulsive shopping_..._CSMR.xlsx" is ~150 chars); nesting the upload
+# scratch dir inside this project's own (already long, OneDrive-synced)
+# path pushed several real filenames over the limit -- Windows reports
+# that as FileNotFoundError, not a path-length error, which is what was
+# actually hit. Saving under the system temp dir instead keeps the base
+# short regardless of where this project lives on disk.
+_MAX_SAFE_PATH_LEN = 240
+
+
+def _safe_filename(directory: Path, name: str) -> str:
+    """Shorten a filename if directory/name would still risk exceeding
+    MAX_PATH even under the short temp-dir base (e.g. a very deep temp
+    path on some systems, or an even longer real-world export name)."""
+    candidate_len = len(str(directory / name))
+    if candidate_len <= _MAX_SAFE_PATH_LEN:
+        return name
+    stem, ext = Path(name).stem, Path(name).suffix
+    overflow = candidate_len - _MAX_SAFE_PATH_LEN
+    truncated_stem = stem[: max(10, len(stem) - overflow)]
+    return f"{truncated_stem}{ext}"
 
 
 def _save_uploads(run_dir: Path, docx_file, excel_files) -> tuple[str, str]:
     input_dir = run_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
 
-    docx_path = input_dir / docx_file.name
+    docx_path = input_dir / _safe_filename(input_dir, docx_file.name)
     docx_path.write_bytes(docx_file.getvalue())
 
     for f in excel_files:
-        (input_dir / f.name).write_bytes(f.getvalue())
+        (input_dir / _safe_filename(input_dir, f.name)).write_bytes(f.getvalue())
 
     return str(docx_path), str(input_dir)
 
@@ -51,7 +73,7 @@ def render():
 
     if run_clicked:
         run_uid = uuid.uuid4().hex[:8]
-        run_dir = DATA_DIR / "uploads" / run_uid
+        run_dir = Path(tempfile.gettempdir()) / "pbrer_uploads" / run_uid
         docx_path, excel_dir = _save_uploads(run_dir, docx_file, excel_files)
 
         with st.spinner("Running Document, Excel, Topic Mapping and Calculation Planning agents... "
