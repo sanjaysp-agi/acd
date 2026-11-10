@@ -19,6 +19,7 @@ from models.schemas import (
     BenchmarkReport,
     DocumentStructure,
     ExecutionPlan,
+    ExtractionReviewFinding,
     MetricResult,
     TopicMappingResult,
     TopicReconstructionResult,
@@ -40,6 +41,7 @@ _MODEL_FIELDS = {
 _LIST_MODEL_FIELDS = {
     "metric_results": MetricResult,
     "topic_reconstruction": TopicReconstructionResult,
+    "extraction_review": ExtractionReviewFinding,
 }
 
 
