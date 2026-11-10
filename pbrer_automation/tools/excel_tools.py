@@ -11,22 +11,39 @@ tenant's export can have a different sheet count, a header at a different
 row, merged cells in different places, or extra columns, and these tools
 must still work.
 
-Library usage, per tool, matches prompt.md Part 2.A:
+Ingestion covers three file formats -- .xlsx, legacy .xls, and .csv --
+under the same "discover from raw content, never assume a fixed shape"
+philosophy: nothing here assumes which format a given upload will be in
+either. A small private dispatch layer (_file_format, _read_dataframe,
+_read_rows_window, _sheet_dimensions, _csv_dimensions,
+_apply_label_value_row) decides, per file, how to get raw rows/columns out
+of it, then feeds that into the same format-agnostic detection logic used
+for every other format. .xlsx keeps its existing openpyxl + zip/XML-based
+code paths untouched (including the fast merged-cell-range trick, which
+only applies to .xlsx -- merges aren't a concept either legacy format
+has). .xls cannot be opened by openpyxl at all (it's a pre-OOXML binary
+format), so it's read via pandas' xlrd engine instead. .csv has no
+"workbook"/"sheet" concept, so each file is treated as a single pseudo-
+sheet named after the file's stem.
+
+Library usage, per tool, matches prompt.md Part 2.A (now format-dispatched
+for .xls/.csv as described above):
   - discover_excel_files   -> pathlib
-  - inspect_workbook       -> openpyxl
-  - inspect_sheet          -> openpyxl
+  - inspect_workbook       -> openpyxl / pandas(xlrd) / csv
+  - inspect_sheet          -> openpyxl / pandas(xlrd) / csv
   - detect_header_row      -> openpyxl + pandas
   - detect_data_region     -> pandas
   - detect_footer_rows     -> pandas + custom logic
   - profile_columns        -> pandas
   - detect_date_formats    -> pandas + custom logic
-  - extract_cover_page_criteria -> openpyxl
+  - extract_cover_page_criteria -> openpyxl / pandas(xlrd) / csv
   - classify_workbook      -> Python heuristics (AI agent interprets result)
   - map_columns_to_schema  -> Python heuristics (AI agent interprets result)
   - match_workbooks        -> Python heuristics (AI agent interprets result)
 """
 from __future__ import annotations
 
+import csv
 import re
 import unicodedata
 import zipfile
@@ -37,6 +54,11 @@ from typing import Any
 
 import openpyxl
 import pandas as pd
+import xlrd  # noqa: F401 -- not called directly; pandas' engine="xlrd" needs it
+# importable, and importing it eagerly here (rather than lazily inside the
+# first .xls-handling function) means a missing/incompatible xlrd install
+# fails loudly at module import time, not on whichever .xls file happens
+# to be processed first.
 from openpyxl.utils import get_column_letter
 
 from config.metric_registry import (
@@ -50,17 +72,135 @@ from config.metric_registry import (
 
 
 # ===========================================================================
+# 0. Per-format dispatch helpers (private)
+# ===========================================================================
+def _file_format(file_path: str | Path) -> str:
+    """Which of the three supported ingestion formats a file is, purely
+    from its suffix -- the dispatch key every per-format helper below
+    branches on. Anything that isn't '.xls' or '.csv' is treated as
+    '.xlsx' (the only format this module ever discovers in the first
+    place via discover_excel_files, so this is a closed set in practice)."""
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".xls":
+        return "xls"
+    if suffix == ".csv":
+        return "csv"
+    return "xlsx"
+
+
+def _csv_dimensions(file_path: str | Path) -> tuple[int, int]:
+    """Row count and max column count for a .csv file via a line-by-line
+    csv.reader scan -- deliberately not pandas, so reporting the shape of
+    a multi-hundred-MB export doesn't require materializing the whole
+    thing in memory first."""
+    row_count = 0
+    max_col = 0
+    with open(file_path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.reader(f):
+            row_count += 1
+            max_col = max(max_col, len(row))
+    return row_count, max_col
+
+
+def _sheet_dimensions(file_path: str | Path, fmt: str, sheet_name: str) -> tuple[int, int]:
+    """(max_row, max_col) for a single non-.xlsx sheet, without going
+    through the full inspect_workbook() call -- that would, for .xls,
+    mean reading every sheet in the file just to learn the dimensions of
+    one."""
+    if fmt == "csv":
+        return _csv_dimensions(file_path)
+    df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, engine="xlrd")
+    return df.shape
+
+
+def _read_rows_window(file_path: str | Path, fmt: str, sheet_name: str, min_row: int, max_row: int) -> dict[int, list[Any]]:
+    """Read a 1-indexed, inclusive row window [min_row, max_row] for a
+    non-.xlsx file, returning the same {row_number: [values...]} shape
+    openpyxl's bounded iter_rows() produces for the .xlsx path. Used by
+    inspect_sheet and detect_footer_rows for their head/tail scans on
+    .csv and .xls files, which have no equivalent of openpyxl's own
+    streaming, bounded row iterator."""
+    if fmt == "csv":
+        rows: dict[int, list[Any]] = {}
+        with open(file_path, newline="", encoding="utf-8-sig", errors="replace") as f:
+            for r, row in enumerate(csv.reader(f), start=1):
+                if r > max_row:
+                    break
+                if r >= min_row:
+                    rows[r] = list(row)
+        return rows
+
+    # .xls: no streaming reader available via xlrd/pandas, so the whole
+    # sheet is read once and sliced -- acceptable given the format's own
+    # hard 65,536-row ceiling.
+    df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, engine="xlrd")
+    rows = {}
+    for idx in range(min_row - 1, min(max_row, len(df))):
+        rows[idx + 1] = df.iloc[idx].tolist()
+    return rows
+
+
+def _read_dataframe(file_path: str | Path, fmt: str, sheet_name: str, header_row: int, nrows: int | None = None) -> pd.DataFrame:
+    """Load a sheet/file into a DataFrame using the detected header row,
+    dispatching to the engine each format needs. For .csv, sheet_name is
+    irrelevant (a .csv file only ever has the one pseudo-sheet) and is
+    ignored."""
+    if fmt == "csv":
+        return pd.read_csv(file_path, header=header_row - 1, nrows=nrows)
+    if fmt == "xls":
+        return pd.read_excel(file_path, sheet_name=sheet_name, header=header_row - 1, nrows=nrows, engine="xlrd")
+    return pd.read_excel(file_path, sheet_name=sheet_name, header=header_row - 1, nrows=nrows)
+
+
+def _apply_label_value_row(raw_fields: dict[str, str], values: list[Any]) -> None:
+    """Shared "first non-null cell = label, next non-null cell = value"
+    scan used by extract_cover_page_criteria for .csv and .xls rows (raw
+    Python values, not openpyxl Cell objects). An empty string is treated
+    as null here, same as a real None/NaN -- CSV in particular has no
+    native null, so a blank field reads back as "" rather than None."""
+    def is_null(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        if isinstance(v, float) and v != v:  # NaN != NaN
+            return True
+        return False
+
+    non_null = [v for v in values if not is_null(v)]
+    if len(non_null) < 2:
+        return
+    label_val, value_val = non_null[0], non_null[1]
+    if not isinstance(label_val, str):
+        return
+    label = label_val.strip().rstrip(":").strip()
+    if label:
+        raw_fields[label] = str(value_val)
+
+
+# ===========================================================================
 # 1. discover_excel_files
 # ===========================================================================
 def discover_excel_files(input_dir: str | Path) -> list[dict[str, Any]]:
-    """Discover uploaded Excel workbooks. No assumption about filenames."""
+    """Discover uploaded data files -- .xlsx, legacy .xls, and .csv alike.
+    No assumption about filenames, and no assumption that every upload in
+    a batch shares one format."""
     input_dir = Path(input_dir)
+    candidates = []
+    for pattern in ("*.xlsx", "*.xls", "*.csv"):
+        candidates.extend(input_dir.glob(pattern))
     found = []
-    for p in sorted(input_dir.glob("*.xlsx")):
+    for p in sorted(candidates):
         if p.name.startswith("~$"):  # Excel lock files
             continue
         found.append({"file_name": p.name, "file_path": str(p), "size_bytes": p.stat().st_size})
     return found
+
+
+# discover_excel_files is kept as the canonical name (existing callers in
+# agents/excel_agent.py and pipeline.py use it directly); this alias just
+# gives callers a more format-neutral name to reach for going forward.
+discover_data_files = discover_excel_files
 
 
 _MERGE_CELL_REF_PATTERN = re.compile(rb'<mergeCell ref="([^"]+)"')
@@ -120,12 +260,54 @@ def inspect_workbook(file_path: str | Path) -> dict[str, Any]:
     and merged-cell presence per sheet. Makes no assumption about how many
     sheets exist or what they're named.
 
-    Loaded read_only=True: this skips building a full in-memory Cell grid
-    with styles for every row, which matters a lot once a sheet runs into
-    tens of thousands of rows (the all-case/all-drug-event exports here
-    are 28k/63k rows) -- read_only mode is openpyxl's own recommended mode
-    for exactly this case. Merge ranges are read separately via
-    _fast_merged_ranges since read_only worksheets don't expose them."""
+    For .csv there is no real "workbook" -- the single file is treated as
+    ONE pseudo-sheet named after the file's stem, with no merge concept.
+    For .xls, every sheet is read via pandas' xlrd engine (openpyxl cannot
+    open legacy .xls at all); merged-cell ranges are always reported empty
+    there too -- extracting them from the old OLE binary structure isn't
+    worth the complexity for a format that's only supported for read
+    compatibility, not as a target for new exports.
+
+    Loaded read_only=True (the .xlsx path): this skips building a full
+    in-memory Cell grid with styles for every row, which matters a lot
+    once a sheet runs into tens of thousands of rows (the all-case/all-
+    drug-event exports here are 28k/63k rows) -- read_only mode is
+    openpyxl's own recommended mode for exactly this case. Merge ranges
+    are read separately via _fast_merged_ranges since read_only
+    worksheets don't expose them."""
+    fmt = _file_format(file_path)
+
+    if fmt == "csv":
+        row_count, max_col = _csv_dimensions(file_path)
+        sheets = [
+            {
+                "sheet_name": Path(file_path).stem,
+                "max_row": row_count,
+                "max_col": max_col,
+                "merged_cell_ranges": [],
+            }
+        ]
+        return {"file_path": str(file_path), "sheet_count": len(sheets), "sheets": sheets}
+
+    if fmt == "xls":
+        # header=None here: raw dimensions, not a header-consumed shape --
+        # so "row 1" in the returned max_row is still available to be the
+        # header row, same convention detect_header_row/inspect_sheet
+        # expect for .xlsx.
+        all_sheets = pd.read_excel(file_path, sheet_name=None, header=None, engine="xlrd")
+        sheets = []
+        for name, df in all_sheets.items():
+            n_rows, n_cols = df.shape
+            sheets.append(
+                {
+                    "sheet_name": name,
+                    "max_row": n_rows,
+                    "max_col": n_cols,
+                    "merged_cell_ranges": [],
+                }
+            )
+        return {"file_path": str(file_path), "sheet_count": len(sheets), "sheets": sheets}
+
     wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
     sheet_xml_paths = _sheet_name_to_xml_path(file_path)
     sheets = []
@@ -154,11 +336,39 @@ def inspect_sheet(file_path: str | Path, sheet_name: str, max_scan_rows: int = 6
     NOT assume where the header or data region is -- that's for
     detect_header_row / detect_footer_rows to determine from this output.
 
-    read_only=True + iter_rows(values_only=True): read_only worksheets do
-    not support efficient random ws.cell(row=, column=) access (each call
-    would re-scan from the start of the row stream), so the head/tail
-    windows are read via bounded iter_rows() calls instead. This is the
-    difference between ~1s and ~60s+ on the 28k/63k-row exports here."""
+    For .csv and .xls, head/tail windows are read via _read_rows_window
+    (there's no openpyxl-style bounded streaming reader for either), and
+    merge_by_row is always {} -- neither format has a merge concept.
+
+    read_only=True + iter_rows(values_only=True) (the .xlsx path):
+    read_only worksheets do not support efficient random ws.cell(row=,
+    column=) access (each call would re-scan from the start of the row
+    stream), so the head/tail windows are read via bounded iter_rows()
+    calls instead. This is the difference between ~1s and ~60s+ on the
+    28k/63k-row exports here."""
+    fmt = _file_format(file_path)
+
+    if fmt != "xlsx":
+        max_row, max_col = _sheet_dimensions(file_path, fmt, sheet_name)
+
+        head_limit = min(max_scan_rows, max_row)
+        head_rows = _read_rows_window(file_path, fmt, sheet_name, 1, head_limit)
+
+        tail_start = max(1, max_row - 9)
+        tail_rows: dict[int, list[Any]] = {}
+        if tail_start > head_limit:
+            tail_rows = _read_rows_window(file_path, fmt, sheet_name, tail_start, max_row)
+
+        return {
+            "file_path": str(file_path),
+            "sheet_name": sheet_name,
+            "max_row": max_row,
+            "max_col": max_col,
+            "head_rows": head_rows,
+            "tail_rows": tail_rows,
+            "merge_by_row": {},
+        }
+
     wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
     ws = wb[sheet_name]
     max_row, max_col = ws.max_row, ws.max_column
@@ -312,8 +522,13 @@ def detect_header_row(sheet_inspection: dict[str, Any], min_columns: int = 2) ->
 def detect_data_region(file_path: str | Path, sheet_name: str, header_row: int) -> dict[str, Any]:
     """Load the sheet with pandas using the detected header row, report the
     resulting shape. Footer trimming happens separately in
-    detect_footer_rows; this just establishes the raw data boundary."""
-    df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row - 1)
+    detect_footer_rows; this just establishes the raw data boundary.
+
+    sheet_name is irrelevant for .csv (ignored by _read_dataframe there --
+    the function still receives it since the signature is shared across
+    all three formats)."""
+    fmt = _file_format(file_path)
+    df = _read_dataframe(file_path, fmt, sheet_name, header_row)
     df = df.dropna(axis=1, how="all")
     return {
         "data_start_row": header_row + 1,
@@ -339,19 +554,31 @@ def detect_footer_rows(file_path: str | Path, sheet_name: str, header_row: int) 
     them. Every row removed is returned explicitly so nothing is silently
     dropped without being accounted for.
 
-    read_only=True, and the whole trailing window is fetched in ONE
-    iter_rows() call (not one call per row) -- on a 63k-row sheet, calling
-    a per-row random-access helper 30+ times each re-scanning from the
-    sheet start would dominate runtime."""
-    wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
-    ws = wb[sheet_name]
-    max_row, max_col = ws.max_row, ws.max_column
+    read_only=True (the .xlsx path), and the whole trailing window is
+    fetched in ONE iter_rows() call (not one call per row) -- on a 63k-row
+    sheet, calling a per-row random-access helper 30+ times each
+    re-scanning from the sheet start would dominate runtime.
 
-    window_start = max(header_row + 1, max_row - 30)
-    rows_by_number: dict[int, list[Any]] = {}
-    for r, row in enumerate(ws.iter_rows(min_row=window_start, max_row=max_row, values_only=True), start=window_start):
-        rows_by_number[r] = list(row)
-    wb.close()
+    For .csv and .xls, the same trailing window is instead fetched via
+    _read_rows_window; everything below this point (scoring/classifying
+    which trailing rows are footer) is identical across all three
+    formats."""
+    fmt = _file_format(file_path)
+
+    if fmt == "xlsx":
+        wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[sheet_name]
+        max_row, max_col = ws.max_row, ws.max_column
+
+        window_start = max(header_row + 1, max_row - 30)
+        rows_by_number: dict[int, list[Any]] = {}
+        for r, row in enumerate(ws.iter_rows(min_row=window_start, max_row=max_row, values_only=True), start=window_start):
+            rows_by_number[r] = list(row)
+        wb.close()
+    else:
+        max_row, max_col = _sheet_dimensions(file_path, fmt, sheet_name)
+        window_start = max(header_row + 1, max_row - 30)
+        rows_by_number = _read_rows_window(file_path, fmt, sheet_name, window_start, max_row)
 
     def row_values(r: int) -> list[Any]:
         return rows_by_number.get(r, [])
@@ -420,7 +647,8 @@ def profile_columns(file_path: str | Path, sheet_name: str, header_row: int, dat
     nrows = None
     if data_end_row is not None:
         nrows = data_end_row - header_row
-    df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row - 1, nrows=nrows)
+    fmt = _file_format(file_path)
+    df = _read_dataframe(file_path, fmt, sheet_name, header_row, nrows=nrows)
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
     profiles = []
@@ -566,21 +794,38 @@ def extract_cover_page_criteria(file_path: str | Path, sheet_name: str) -> dict[
     take the first non-null cell as the label (if it's a string) and the
     NEXT non-null cell on that row as its value. Rows with more than 2
     non-null string cells (e.g. the legend row) still get captured this
-    way but simply won't match any known criterion-type label below."""
-    wb = openpyxl.load_workbook(file_path, data_only=True, read_only=False)
-    ws = wb[sheet_name]
+    way but simply won't match any known criterion-type label below.
+
+    A cover-page sheet is a pretty .xlsx-specific PBRER-export convention
+    (a dedicated sheet of search criteria), so .csv/.xls extraction here
+    is lower-fidelity best-effort: it applies the exact same row-scan
+    logic via _apply_label_value_row, just fed from each format's own raw
+    rows instead of openpyxl Cell objects."""
+    fmt = _file_format(file_path)
     raw_fields: dict[str, str] = {}
-    for row in ws.iter_rows():
-        non_null = [c for c in row if c.value is not None]
-        if len(non_null) < 2:
-            continue
-        label_cell, value_cell = non_null[0], non_null[1]
-        if not isinstance(label_cell.value, str):
-            continue
-        label = label_cell.value.strip().rstrip(":").strip()
-        if label:
-            raw_fields[label] = str(value_cell.value)
-    wb.close()
+
+    if fmt == "csv":
+        with open(file_path, newline="", encoding="utf-8-sig", errors="replace") as f:
+            for row in csv.reader(f):
+                _apply_label_value_row(raw_fields, row)
+    elif fmt == "xls":
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, engine="xlrd")
+        for row in df.values.tolist():
+            _apply_label_value_row(raw_fields, row)
+    else:
+        wb = openpyxl.load_workbook(file_path, data_only=True, read_only=False)
+        ws = wb[sheet_name]
+        for row in ws.iter_rows():
+            non_null = [c for c in row if c.value is not None]
+            if len(non_null) < 2:
+                continue
+            label_cell, value_cell = non_null[0], non_null[1]
+            if not isinstance(label_cell.value, str):
+                continue
+            label = label_cell.value.strip().rstrip(":").strip()
+            if label:
+                raw_fields[label] = str(value_cell.value)
+        wb.close()
 
     criterion_type = CriterionType.UNKNOWN
     criterion_value = None

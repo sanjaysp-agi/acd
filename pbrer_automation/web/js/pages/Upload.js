@@ -39,18 +39,18 @@ export default function Upload({ setRunId, invalidate, navigate }) {
 
   return html`
     <h2>Upload Documents</h2>
-    <p class="caption">Previous/approved PBRER, current Excel exports, and the reporting interval -- the only inputs this application needs.</p>
+    <p class="caption">Previous/approved PBRER document, current data exports, and the reporting interval -- the only inputs this application needs.</p>
 
     ${error && html`<${Banner} kind="error">${error}<//>`}
 
     ${!activeRunId && html`
       <div class="field">
-        <label>Previous/approved PBRER (.docx)</label>
-        <input type="file" accept=".docx" onChange=${(e) => setDocxFile(e.target.files[0] || null)} />
+        <label>Previous/approved PBRER (.docx, .pdf, or .txt)</label>
+        <input type="file" accept=".docx,.pdf,.txt" onChange=${(e) => setDocxFile(e.target.files[0] || null)} />
       </div>
       <div class="field">
-        <label>Excel exports (all-case, all-drug-event, and any topic-specific case/drug-event pairs)</label>
-        <input type="file" accept=".xlsx" multiple onChange=${(e) => setExcelFiles(Array.from(e.target.files))} />
+        <label>Data exports (all-case, all-drug-event, and any topic-specific case/drug-event pairs -- .xlsx, .xls, or .csv)</label>
+        <input type="file" accept=".xlsx,.xls,.csv" multiple onChange=${(e) => setExcelFiles(Array.from(e.target.files))} />
       </div>
       <div class="card-row">
         <div class="field"><label>Reporting start date</label><input type="date" value=${start} onInput=${(e) => setStart(e.target.value)} /></div>
@@ -63,7 +63,7 @@ export default function Upload({ setRunId, invalidate, navigate }) {
       </button>
 
       ${!canRun && !submitting && html`
-        <p class="caption">Upload both the PBRER document and at least one Excel export to enable the run.</p>
+        <p class="caption">Upload both the PBRER document and at least one data export to enable the run.</p>
       `}
     `}
 

@@ -1,29 +1,48 @@
 """
-Predefined, typed Python tools for autonomous Word-document investigation
+Predefined, typed Python tools for autonomous document investigation
 (the previous/approved PBRER). No tool here assumes a specific heading
 style name, that section numbers are literal text, or that "16.3" is the
 right prefix for this tenant's document -- a different tenant's PBRER
 could use real Word "Heading 1/2/3" styles, a different custom style
-family, or no reliable style at all. Everything is discovered from the
-document's own content and formatting at call time.
+family, numbered section headings typed directly into the prose, or no
+reliable style at all. Everything is discovered from the document's own
+content and formatting at call time.
 
-Library: python-docx throughout (PyMuPDF only if/when PDF support is
-needed -- not required for the current .docx input).
+Input formats: .docx, .pdf, and .txt. Every public function accepts any
+of the three and dispatches internally on the file extension. To keep
+that dispatch in exactly one place, every function works off a private
+intermediate representation (IR) built by `_load_blocks`: a flat, ordered
+list of block dicts, each either
+  {"kind": "paragraph", "text": str, "style_name": str | None,
+   "outline_level": int | None, "is_bold": bool}
+or
+  {"kind": "table", "rows": [[cell_text, ...], ...]}
+in true document order (paragraphs and tables interleaved the way they
+physically occur). A block's position in this list is its `block_index`,
+and that index space is the same one every other tool call uses for the
+same file -- it is what makes `extract_tables_near_heading`,
+`extract_topic_subtree`, and `calibrate_section_numbers`'s caller context
+all agree on "where" a heading or table sits.
+
+Libraries: python-docx for .docx, pdfplumber for .pdf, the standard
+library for .txt.
 """
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import docx
+import pdfplumber
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 
 # ===========================================================================
-# Shared: true document-order iteration (paragraphs AND tables interleaved)
+# Shared IR: _load_blocks and its per-format loaders
 # ===========================================================================
 def _iter_block_items(document) -> list[tuple[str, Any]]:
     """Yield (kind, object) for every paragraph/table in true document
@@ -62,19 +81,206 @@ def _is_bold_paragraph(paragraph: Paragraph) -> bool:
     return all(r.bold for r in runs)
 
 
+def _resolve_docx_table_rows(table: Table) -> list[list[str]]:
+    """Resolve a python-docx table into a plain 2D grid of cell text,
+    handling vertically-merged cells before anything downstream ever sees
+    them. python-docx's `row.cells` re-exposes a merged cell's content for
+    EVERY row it spans (same underlying <w:tc> element, read multiple
+    times), so a naive per-row join double-counts merged content into
+    unrelated rows (observed on the Impulse Control Disorders table:
+    "Spontaneous" and "Report from other studies" ended up concatenated).
+    Fixed by comparing each cell to the one directly above it in the same
+    column by identity (`is`, not text equality) -- a repeat means "this
+    is a merge continuation of the row above", represented here as an
+    empty string so every later consumer of the IR can treat a docx grid
+    exactly like a pdf/txt grid with no further merge-awareness needed."""
+    rows: list[list[str]] = []
+    prev_cells = None
+    for row in table.rows:
+        cells = row.cells
+        texts = []
+        for i, cell in enumerate(cells):
+            is_continuation = prev_cells is not None and i < len(prev_cells) and cell._tc is prev_cells[i]._tc
+            texts.append("" if is_continuation else cell.text.strip())
+        rows.append(texts)
+        prev_cells = cells
+    return rows
+
+
+def _load_docx_blocks(file_path: str | Path) -> list[dict[str, Any]]:
+    document = docx.Document(str(file_path))
+    blocks: list[dict[str, Any]] = []
+    for kind, obj in _iter_block_items(document):
+        if kind == "paragraph":
+            blocks.append({
+                "kind": "paragraph",
+                "text": obj.text,
+                "style_name": obj.style.name,
+                "outline_level": _get_outline_level(obj),
+                "is_bold": _is_bold_paragraph(obj),
+            })
+        else:
+            blocks.append({"kind": "table", "rows": _resolve_docx_table_rows(obj)})
+    return blocks
+
+
+_BOLD_FONT_HINT_PATTERN = re.compile(r"bold|black|heavy", re.IGNORECASE)
+_LINE_Y_TOLERANCE = 3.0
+
+
+def _word_in_bbox(word: dict[str, Any], bbox: tuple[float, float, float, float]) -> bool:
+    """True if a word's center falls inside a table's bounding box. Needed
+    because pdfplumber's `extract_words` returns every word on the page,
+    including the ones sitting inside table cells -- without this filter
+    a table's own text would be double-counted as ordinary paragraph lines
+    AND as table rows."""
+    x0, top, x1, bottom = bbox
+    center_x = (word["x0"] + word["x1"]) / 2
+    center_y = (word["top"] + word["bottom"]) / 2
+    return x0 <= center_x <= x1 and top <= center_y <= bottom
+
+
+def _group_words_into_lines(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Reconstruct reading-order text lines from pdfplumber's flat word
+    list by clustering words whose vertical position agrees within a
+    small tolerance, then ordering each line's words left-to-right and
+    the lines themselves top-to-bottom."""
+    lines: list[list[dict[str, Any]]] = []
+    for word in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        for line in lines:
+            if abs(line[0]["top"] - word["top"]) <= _LINE_Y_TOLERANCE:
+                line.append(word)
+                break
+        else:
+            lines.append([word])
+    for line in lines:
+        line.sort(key=lambda w: w["x0"])
+    lines.sort(key=lambda line: line[0]["top"])
+    return lines
+
+
+def _line_is_bold(words: list[dict[str, Any]]) -> bool:
+    bold_count = sum(1 for w in words if _BOLD_FONT_HINT_PATTERN.search(w.get("fontname") or ""))
+    return bold_count * 2 >= len(words)
+
+
+def _line_font_size(words: list[dict[str, Any]]) -> float | None:
+    sizes = [round(w["size"], 1) for w in words if w.get("size") is not None]
+    if not sizes:
+        return None
+    return Counter(sizes).most_common(1)[0][0]
+
+
+def _load_pdf_blocks(file_path: str | Path) -> list[dict[str, Any]]:
+    """Build paragraph/table IR blocks per page, keeping tables roughly
+    where they visually occur relative to the surrounding text the same
+    way `_iter_block_items` keeps docx paragraphs/tables in document
+    order -- exact pixel-perfect interleaving is not required, only that
+    a table doesn't end up miles away from the heading it belongs under.
+    Paragraph blocks carry an extra, IR-internal `font_size` hint (not
+    part of the documented IR shape, since neither docx nor txt have an
+    equivalent) that the pdf-specific heading heuristic and the
+    diagnostic tools' synthetic style naming use."""
+    blocks: list[dict[str, Any]] = []
+    with pdfplumber.open(str(file_path)) as pdf:
+        for page in pdf.pages:
+            tables = page.find_tables()
+            table_bboxes = [t.bbox for t in tables]
+
+            words = page.extract_words(extra_attrs=["size", "fontname"])
+            text_words = [w for w in words if not any(_word_in_bbox(w, bbox) for bbox in table_bboxes)]
+            lines = _group_words_into_lines(text_words)
+
+            page_items: list[tuple[float, dict[str, Any]]] = []
+            for line in lines:
+                text = " ".join(w["text"] for w in line).strip()
+                if not text:
+                    continue
+                page_items.append((line[0]["top"], {
+                    "kind": "paragraph",
+                    "text": text,
+                    "style_name": None,
+                    "outline_level": None,
+                    "is_bold": _line_is_bold(line),
+                    "font_size": _line_font_size(line),
+                }))
+            for table in tables:
+                rows = [[(cell or "").strip() for cell in row] for row in table.extract()]
+                page_items.append((table.bbox[1], {"kind": "table", "rows": rows}))
+
+            page_items.sort(key=lambda item: item[0])
+            blocks.extend(item for _, item in page_items)
+    return blocks
+
+
+def _load_txt_blocks(file_path: str | Path) -> list[dict[str, Any]]:
+    """Split a plain-text document into paragraph blocks on blank-line
+    boundaries. Plain text carries no style, outline, or bold signal at
+    all, so heading detection for .txt relies entirely on the
+    numbered-heading and all-caps strategies in `detect_headings`."""
+    path = Path(file_path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw = path.read_text(encoding="latin-1")
+
+    blocks: list[dict[str, Any]] = []
+    for chunk in re.split(r"\n\s*\n", raw):
+        text = chunk.strip()
+        if not text:
+            continue
+        blocks.append({
+            "kind": "paragraph",
+            "text": text,
+            "style_name": None,
+            "outline_level": None,
+            "is_bold": False,
+        })
+    return blocks
+
+
+def _load_blocks(file_path: str | Path) -> list[dict[str, Any]]:
+    """The single place that decides, by file extension, how to turn a
+    document into the shared IR block list. Every other function in this
+    module reads blocks through here so that `block_index` means the same
+    thing everywhere for a given file."""
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".docx":
+        return _load_docx_blocks(file_path)
+    if suffix == ".pdf":
+        return _load_pdf_blocks(file_path)
+    if suffix == ".txt":
+        return _load_txt_blocks(file_path)
+    raise ValueError(f"Unsupported document format '{suffix}' (expected .docx, .pdf, or .txt)")
+
+
+def _resolve_style_label(block: dict[str, Any]) -> str:
+    """Diagnostic-only style label used by inspect_document_metadata and
+    sample_paragraph_styles. docx paragraphs already carry a real style
+    name; pdf has no style concept at all, so distinct font sizes are
+    treated as a synthetic style family (a same-size line is, in effect,
+    the same "style") rather than reporting nothing useful."""
+    if block.get("style_name"):
+        return block["style_name"]
+    font_size = block.get("font_size")
+    if font_size is not None:
+        return f"pdf_font_{font_size}pt"
+    return "(no style)"
+
+
 # ===========================================================================
 # 1. inspect_document_metadata
 # ===========================================================================
 def inspect_document_metadata(file_path: str | Path) -> dict[str, Any]:
-    document = docx.Document(str(file_path))
-    blocks = _iter_block_items(document)
-    paragraphs = [b for k, b in blocks if k == "paragraph"]
-    tables = [b for k, b in blocks if k == "table"]
+    blocks = _load_blocks(file_path)
+    paragraphs = [b for b in blocks if b["kind"] == "paragraph"]
+    tables = [b for b in blocks if b["kind"] == "table"]
     style_usage: dict[str, int] = {}
     total_words = 0
     for p in paragraphs:
-        style_usage[p.style.name] = style_usage.get(p.style.name, 0) + 1
-        total_words += len(p.text.split())
+        label = _resolve_style_label(p)
+        style_usage[label] = style_usage.get(label, 0) + 1
+        total_words += len(p["text"].split())
     return {
         "file_path": str(file_path),
         "block_count": len(blocks),
@@ -89,16 +295,15 @@ def inspect_document_metadata(file_path: str | Path) -> dict[str, Any]:
 # 2. sample_paragraph_styles
 # ===========================================================================
 def sample_paragraph_styles(file_path: str | Path, max_samples: int = 3) -> list[dict[str, Any]]:
-    document = docx.Document(str(file_path))
-    blocks = _iter_block_items(document)
+    blocks = _load_blocks(file_path)
     by_style: dict[str, list[str]] = {}
-    for kind, b in blocks:
-        if kind != "paragraph":
+    for b in blocks:
+        if b["kind"] != "paragraph":
             continue
-        text = b.text.strip()
+        text = b["text"].strip()
         if not text:
             continue
-        by_style.setdefault(b.style.name, []).append(text)
+        by_style.setdefault(_resolve_style_label(b), []).append(text)
 
     out = []
     for style_name, texts in by_style.items():
@@ -122,6 +327,8 @@ _ORDINAL_TOKEN_PATTERN = re.compile(
     r"\b(\d+)(?:st|nd|rd|th)?\b|\b(first|second|third|fourth|fifth|sixth|seventh)\b", re.IGNORECASE
 )
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7}
+_NUMBERED_HEADING_PATTERN = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,4})\.?\s+\S")
+_MAX_HEADING_TEXT_LENGTH = 150
 
 
 def _extract_level_from_style_name(style_name: str) -> int | None:
@@ -133,43 +340,75 @@ def _extract_level_from_style_name(style_name: str) -> int | None:
     return _ORDINAL_WORDS.get(m.group(2).lower())
 
 
-def detect_headings(file_path: str | Path) -> dict[str, Any]:
-    """Three strategies, tried in order of reliability:
+def _numbered_heading_headings(paragraphs: list[tuple[int, dict[str, Any]]]) -> tuple[list[dict[str, Any]], str | None]:
+    """A line counts as a heading if its text starts with a dotted
+    numeral like "16.3" or "16.3.1.2" (optionally followed by a period),
+    then a space and more text -- exactly how most PBRER/regulatory
+    documents actually type their section headings, and the strongest
+    signal available when present, since it works identically regardless
+    of format. The level is simply how many dot-separated segments the
+    number has. Only adopted if it finds at least 2 headings spanning
+    more than one distinct level -- the same quality bar the style_name
+    strategy uses -- so a single body sentence that happens to start with
+    a number doesn't get mistaken for a whole numbering scheme."""
+    candidates = []
+    for block_idx, p in paragraphs:
+        text = p["text"].strip()
+        if not text or len(text) > _MAX_HEADING_TEXT_LENGTH:
+            continue
+        m = _NUMBERED_HEADING_PATTERN.match(text)
+        if not m:
+            continue
+        number = m.group(1)
+        level = number.count(".") + 1
+        # Strip the typed number back off -- it's recovered independently
+        # via reconstruct_section_numbers/calibrate_section_numbers, so
+        # leaving it in `text` would show it twice (once as the literal
+        # prefix, once as the reconstructed section_number) wherever a
+        # topic's title is displayed.
+        title_text = text[m.end(1):].lstrip(". ").strip() or text
+        candidates.append({
+            "block_index": block_idx,
+            "text": title_text,
+            "style_name": p.get("style_name"),
+            "level": level,
+            "strategy": "numbered_heading",
+        })
+    distinct_levels = {h["level"] for h in candidates}
+    if len(candidates) >= 2 and len(distinct_levels) >= 2:
+        return candidates, "numbered_heading"
+    return [], None
+
+
+def _docx_fallback_headings(paragraphs: list[tuple[int, dict[str, Any]]]) -> tuple[list[dict[str, Any]], str]:
+    """Three strategies, tried in order of reliability, for documents
+    with no usable numbered-heading convention:
       1. style_name: a cluster of distinct, moderately-frequent styles
          whose names look heading-like (contain "heading"/"level"/"title"/
          "outline"), with a level number recovered from each style name.
       2. outline_level: Word's own w:outlineLvl paragraph property, when
          present, independent of style naming.
       3. bold_heuristic: short, fully-bold paragraphs with no run style
-         evidence at all -- last resort, lower confidence.
-    Returns every heading found, in document order, each tagged with the
-    strategy that identified it."""
-    document = docx.Document(str(file_path))
-    blocks = _iter_block_items(document)
-    paragraphs = [(i, b) for i, (kind, b) in enumerate(blocks) if kind == "paragraph"]
-
+         evidence at all -- last resort, lower confidence."""
     style_counts: dict[str, int] = {}
     for _, p in paragraphs:
-        if p.text.strip():
-            style_counts[p.style.name] = style_counts.get(p.style.name, 0) + 1
+        if p["text"].strip():
+            style_counts[p["style_name"]] = style_counts.get(p["style_name"], 0) + 1
 
     heading_like_styles = {
         name: count for name, count in style_counts.items()
-        if _HEADING_STYLE_NAME_PATTERN.search(name) and 0 < count <= max(500, len(paragraphs) * 0.3)
+        if name and _HEADING_STYLE_NAME_PATTERN.search(name) and 0 < count <= max(500, len(paragraphs) * 0.3)
     }
 
-    headings = []
-    strategy = None
-
     if len(heading_like_styles) >= 2:
-        strategy = "style_name"
+        headings = []
         level_by_style: dict[str, int] = {}
         next_fallback_level = 1
         seen_order: list[str] = []
         for block_idx, p in paragraphs:
-            if p.style.name not in heading_like_styles or not p.text.strip():
+            style_name = p["style_name"]
+            if style_name not in heading_like_styles or not p["text"].strip():
                 continue
-            style_name = p.style.name
             if style_name not in level_by_style:
                 extracted = _extract_level_from_style_name(style_name)
                 if extracted is not None:
@@ -181,43 +420,134 @@ def detect_headings(file_path: str | Path) -> dict[str, Any]:
             headings.append(
                 {
                     "block_index": block_idx,
-                    "text": p.text.strip(),
+                    "text": p["text"].strip(),
                     "style_name": style_name,
                     "level": level_by_style[style_name],
                     "strategy": "style_name",
                 }
             )
-    else:
-        outline_hits = [(i, p, _get_outline_level(p)) for i, p in paragraphs]
-        outline_hits = [(i, p, lvl) for i, p, lvl in outline_hits if lvl is not None and p.text.strip()]
-        if outline_hits:
-            strategy = "outline_level"
-            for block_idx, p, lvl in outline_hits:
-                headings.append(
-                    {
-                        "block_index": block_idx,
-                        "text": p.text.strip(),
-                        "style_name": p.style.name,
-                        "level": lvl + 1,  # outlineLvl is 0-based
-                        "strategy": "outline_level",
-                    }
-                )
+        return headings, "style_name"
+
+    outline_hits = [(i, p) for i, p in paragraphs if p["outline_level"] is not None and p["text"].strip()]
+    if outline_hits:
+        headings = [
+            {
+                "block_index": i,
+                "text": p["text"].strip(),
+                "style_name": p["style_name"],
+                "level": p["outline_level"] + 1,  # outlineLvl is 0-based
+                "strategy": "outline_level",
+            }
+            for i, p in outline_hits
+        ]
+        return headings, "outline_level"
+
+    headings = []
+    for block_idx, p in paragraphs:
+        text = p["text"].strip()
+        if not text or len(text) > 120 or text.endswith((".", ",", ";")):
+            continue
+        if p["is_bold"]:
+            headings.append(
+                {
+                    "block_index": block_idx,
+                    "text": text,
+                    "style_name": p["style_name"],
+                    "level": 1,  # cannot distinguish depth reliably from bold alone
+                    "strategy": "bold_heuristic",
+                }
+            )
+    return headings, "bold_heuristic"
+
+
+def _font_size_heuristic_headings(paragraphs: list[tuple[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """pdf fallback when there is no numbered-heading convention: a line
+    qualifies as a heading if its dominant font size is meaningfully
+    larger than the page's most common (body-text) size, or if it is
+    bold. Distinct larger sizes are ranked into levels, biggest = level 1;
+    bold-but-body-sized lines (no size signal to rank by) are bundled
+    into one additional, deepest level."""
+    sized = [(i, p) for i, p in paragraphs if p.get("font_size") is not None]
+    if not sized:
+        return []
+
+    size_counts = Counter(p["font_size"] for _, p in sized)
+    body_size, _ = size_counts.most_common(1)[0]
+    larger_sizes = sorted({s for s in size_counts if s > body_size + 0.5}, reverse=True)
+    if not larger_sizes:
+        return []
+    level_by_size = {size: level + 1 for level, size in enumerate(larger_sizes)}
+    bold_fallback_level = len(larger_sizes) + 1
+
+    headings = []
+    for block_idx, p in sized:
+        text = p["text"].strip()
+        if not text or len(text) > _MAX_HEADING_TEXT_LENGTH:
+            continue
+        size = p["font_size"]
+        if size in level_by_size:
+            level = level_by_size[size]
+        elif p["is_bold"]:
+            level = bold_fallback_level
         else:
-            strategy = "bold_heuristic"
-            for block_idx, p in paragraphs:
-                text = p.text.strip()
-                if not text or len(text) > 120 or text.endswith((".", ",", ";")):
-                    continue
-                if _is_bold_paragraph(p):
-                    headings.append(
-                        {
-                            "block_index": block_idx,
-                            "text": text,
-                            "style_name": p.style.name,
-                            "level": 1,  # cannot distinguish depth reliably from bold alone
-                            "strategy": "bold_heuristic",
-                        }
-                    )
+            continue
+        headings.append({
+            "block_index": block_idx,
+            "text": text,
+            "style_name": None,
+            "level": level,
+            "strategy": "font_size_heuristic",
+        })
+    return headings
+
+
+def _all_caps_heading_fallback(paragraphs: list[tuple[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """txt last resort when no numbered-heading convention is found:
+    plain text has no bold/style/size signal at all, so a short,
+    fully-upper-case line is the only remaining clue -- lower confidence,
+    mirroring the role the bold_heuristic plays for docx."""
+    headings = []
+    for block_idx, p in paragraphs:
+        text = p["text"].strip()
+        if not text or len(text) >= 100:
+            continue
+        if text.isupper():
+            headings.append({
+                "block_index": block_idx,
+                "text": text,
+                "style_name": None,
+                "level": 1,
+                "strategy": "all_caps_heuristic",
+            })
+    return headings
+
+
+def detect_headings(file_path: str | Path) -> dict[str, Any]:
+    """Tries the numbered-heading strategy first (works identically
+    across .docx/.pdf/.txt and is the strongest signal when present),
+    then falls through to a format-specific chain: style_name ->
+    outline_level -> bold_heuristic for .docx, font_size_heuristic for
+    .pdf, all_caps_heuristic for .txt. Returns every heading found, in
+    document order, each tagged with the strategy that identified it, or
+    `strategy: None, headings: []` if nothing is found at all -- this
+    never raises on a document with no detectable heading convention,
+    since the calling agent already treats an empty heading list as a
+    critical warning rather than a crash."""
+    blocks = _load_blocks(file_path)
+    paragraphs = [(i, b) for i, b in enumerate(blocks) if b["kind"] == "paragraph"]
+
+    headings, strategy = _numbered_heading_headings(paragraphs)
+
+    if strategy is None:
+        suffix = Path(file_path).suffix.lower()
+        if suffix == ".docx":
+            headings, strategy = _docx_fallback_headings(paragraphs)
+        elif suffix == ".pdf":
+            headings = _font_size_heuristic_headings(paragraphs)
+            strategy = "font_size_heuristic" if headings else None
+        else:
+            headings = _all_caps_heading_fallback(paragraphs)
+            strategy = "all_caps_heuristic" if headings else None
 
     return {"strategy": strategy, "headings": headings, "total_blocks": len(blocks)}
 
@@ -299,8 +629,8 @@ def calibrate_section_numbers(file_path: str | Path, target_heading_text: str,
     trailing subsequence is real, falsifiable evidence; if it still can't
     be confirmed, say so rather than guessing -- an uncalibrated number is
     a review flag, not a reported fact."""
-    document = docx.Document(str(file_path))
-    full_text = "\n".join(p.text for p in document.paragraphs)
+    blocks = _load_blocks(file_path)
+    full_text = "\n".join(b["text"] for b in blocks if b["kind"] == "paragraph")
     citations = _SECTION_CITATION_PATTERN.findall(full_text)
     if not citations:
         return {"absolute_number": None, "confidence": 0.0, "evidence": "no 'Section x.y.z' citations found in document text"}
@@ -311,8 +641,6 @@ def calibrate_section_numbers(file_path: str | Path, target_heading_text: str,
     if not matches:
         return {"absolute_number": None, "confidence": 0.0,
                 "evidence": f"no citation's trailing {n} segment(s) match relative chain '{target_relative_number}'"}
-
-    from collections import Counter
 
     best, count = Counter(matches).most_common(1)[0]
     # Multi-segment agreement is much stronger evidence than a single
@@ -372,53 +700,45 @@ def extract_topic_subtree(headings_with_numbers: list[dict[str, Any]], target_bl
 # ===========================================================================
 # 8. extract_tables_near_heading
 # ===========================================================================
+def _reshape_table_rows(raw_rows: list[list[str]]) -> list[dict[str, str]]:
+    """Generic 2-column label/value reshaping, applied uniformly to every
+    format's raw table grid. docx grids have already had merge
+    continuations collapsed to empty strings by `_load_blocks`, so a
+    continuation cell behaves exactly like a genuinely empty one here --
+    there is nothing format-specific left to handle at this point."""
+    rows = []
+    for texts in raw_rows:
+        if len(texts) >= 2:
+            label = texts[0]
+            value_parts = [t for t in texts[1:] if t]
+            if label or value_parts:
+                rows.append({"label": label, "value": " | ".join(value_parts)})
+        elif texts and texts[0]:
+            rows.append({"label": texts[0], "value": ""})
+    return rows
+
+
 def extract_tables_near_heading(file_path: str | Path, heading_block_index: int,
                                  next_heading_block_index: int | None) -> dict[str, Any]:
     """Collect every table AND every non-empty paragraph physically
     located between this heading and the next one (or end of document),
-    using true document order. Word PBRER tables used for topic data are
+    using true document order. PBRER tables used for topic data are
     typically simple 2-column label/value tables -- parsed generically as
-    a list of {label, value} rows, not assuming a fixed row count.
-
-    Vertically-merged cells are a real hazard here: python-docx's
-    `row.cells` re-exposes a merged cell's content for EVERY row it spans
-    (same underlying <w:tc> element, read multiple times), so a naive
-    per-row join double-counts merged content into unrelated label rows
-    (observed on the Impulse Control Disorders table: "Spontaneous" and
-    "Report from other studies" ended up concatenated). Fixed by comparing
-    each cell to the one directly above it in the same column by identity
-    (`is`, not text equality) -- a repeat means "this is a merge
-    continuation of the row above", not new content for the current row."""
-    document = docx.Document(str(file_path))
-    blocks = _iter_block_items(document)
+    a list of {label, value} rows, not assuming a fixed row count."""
+    blocks = _load_blocks(file_path)
 
     end = next_heading_block_index if next_heading_block_index is not None else len(blocks)
     tables_out = []
     paragraphs_out = []
-    for idx, (kind, b) in enumerate(blocks):
+    for idx, block in enumerate(blocks):
         if idx <= heading_block_index or idx >= end:
             continue
-        if kind == "table":
-            rows = []
-            prev_cells = None
-            for row in b.rows:
-                cells = row.cells
-                is_continuation = [
-                    prev_cells is not None and i < len(prev_cells) and cell._tc is prev_cells[i]._tc
-                    for i, cell in enumerate(cells)
-                ]
-                texts = [c.text.strip() for c in cells]
-                if len(cells) >= 2:
-                    label = texts[0] if not is_continuation[0] else ""
-                    value_parts = [texts[i] for i in range(1, len(cells)) if not is_continuation[i] and texts[i]]
-                    if label or value_parts:
-                        rows.append({"label": label, "value": " | ".join(value_parts)})
-                elif cells and not is_continuation[0]:
-                    rows.append({"label": texts[0], "value": ""})
-                prev_cells = cells
-            tables_out.append({"block_index": idx, "rows": rows})
-        elif kind == "paragraph" and b.text.strip():
-            paragraphs_out.append({"block_index": idx, "text": b.text.strip()})
+        if block["kind"] == "table":
+            tables_out.append({"block_index": idx, "rows": _reshape_table_rows(block["rows"])})
+        else:
+            text = block["text"].strip()
+            if text:
+                paragraphs_out.append({"block_index": idx, "text": text})
 
     return {"tables": tables_out, "paragraphs": paragraphs_out}
 

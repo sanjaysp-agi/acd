@@ -39,6 +39,26 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_list(name: str, default: tuple[str, ...], sep: str = "|") -> tuple[str, ...]:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    items = tuple(item.strip() for item in val.split(sep) if item.strip())
+    return items or default
+
+
+# Narrative-document and tabular-data formats this pipeline can ingest.
+# Overridable per deployment (e.g. a tenant whose exporter only ever
+# produces .csv) without a code change -- these are capability lists, not
+# facts about any one tenant's file shape.
+NARRATIVE_DOCUMENT_EXTENSIONS: tuple[str, ...] = _env_list(
+    "PBRER_NARRATIVE_EXTENSIONS", (".docx", ".pdf", ".txt")
+)
+TABULAR_DATA_EXTENSIONS: tuple[str, ...] = _env_list(
+    "PBRER_TABULAR_EXTENSIONS", (".xlsx", ".xls", ".csv")
+)
+
+
 @dataclass(frozen=True)
 class LLMSettings:
     provider: str = os.environ.get("PBRER_LLM_PROVIDER", "local")  # "local" | "bedrock"
@@ -71,8 +91,30 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class DocumentAgentSettings:
+    # Candidate titles for the PBRER section that contains topic-level
+    # safety evaluations -- domain configuration for "what we are looking
+    # for in a PBRER" (this application's whole purpose), not a guess about
+    # one tenant's wording. Multiple phrasings are tried because different
+    # PBRER templates/versions word this heading slightly differently; a
+    # deployment onboarding a template that uses a third phrasing adds it
+    # here instead of patching code.
+    target_section_title_candidates: tuple[str, ...] = _env_list(
+        "PBRER_TARGET_SECTION_TITLES",
+        ("Evaluation of Risks and New Information", "Signal and Risk Evaluation"),
+    )
+    # The leaf topics we want metrics for sit this many heading-levels below
+    # the target section header (16.3 -> 16.3.1 "New information on
+    # important identified risks" -> 16.3.1.1 "Cardiac failure" = 2). A
+    # template nesting its topics at a different depth overrides this via
+    # env var rather than requiring a code change.
+    leaf_topic_depth_below_target: int = _env_int("PBRER_LEAF_TOPIC_DEPTH", 2)
+
+
+@dataclass(frozen=True)
 class AppSettings:
     llm: LLMSettings = field(default_factory=LLMSettings)
+    document_agent: DocumentAgentSettings = field(default_factory=DocumentAgentSettings)
     rounding_decimals: int = _env_int("PBRER_ROUNDING_DECIMALS", 1)
     low_confidence_threshold: float = float(os.environ.get("PBRER_LOW_CONFIDENCE_THRESHOLD", "0.6"))
 

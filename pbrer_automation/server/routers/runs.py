@@ -7,16 +7,27 @@ there a run yet" check every other Streamlit page used to do via
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from config.settings import NARRATIVE_DOCUMENT_EXTENSIONS, TABULAR_DATA_EXTENSIONS
 from observability import run_manager, run_store
 from server.serialization import result_to_json
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+
+
+def _reject_unsupported_extensions(files: list[UploadFile], allowed: tuple[str, ...], role: str) -> None:
+    for f in files:
+        if Path(f.filename or "").suffix.lower() not in allowed:
+            raise HTTPException(
+                400,
+                f"'{f.filename}' is not a supported {role} format. Supported: {', '.join(allowed)}.",
+            )
 
 
 @router.post("")
@@ -27,7 +38,10 @@ async def create_run(
     reporting_end: str = Form(...),
 ) -> dict[str, str]:
     if not docx_file or not excel_files:
-        raise HTTPException(400, "Both the PBRER document and at least one Excel export are required.")
+        raise HTTPException(400, "Both the previous/approved PBRER document and at least one data export are required.")
+
+    _reject_unsupported_extensions([docx_file], NARRATIVE_DOCUMENT_EXTENSIONS, "narrative document")
+    _reject_unsupported_extensions(excel_files, TABULAR_DATA_EXTENSIONS, "data export")
 
     run_id = run_manager.new_run_id()
     docx_bytes = await docx_file.read()

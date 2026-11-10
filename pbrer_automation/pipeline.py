@@ -1,8 +1,8 @@
 """
-Top-level pipeline: ties the four understanding/planning agents to the
+Top-level pipeline: ties the understanding/planning/review agents to the
 deterministic calculation engine and the validation/benchmark modules.
-This is what the Streamlit frontend (and tests) call -- a single place
-that reflects the real run order from prompt.md Part 10.
+This is what the frontend (and tests) call -- a single place that
+reflects the real run order from prompt.md Part 10.
 """
 from __future__ import annotations
 
@@ -13,12 +13,17 @@ from typing import Any
 from agents.calculation_planner import CalculationPlanningAgent
 from agents.document_agent import DocumentUnderstandingAgent
 from agents.excel_agent import ExcelUnderstandingAgent
+from agents.extraction_review_agent import ExtractionReviewAgent
 from agents.topic_mapping_agent import TopicMappingAgent
 from config.metric_registry import CanonicalField, WorkbookType
 from models.schemas import (
+    DocumentStructure,
     ExecutionPlan,
+    ExtractionReviewFinding,
+    MetricResult,
     TopicMappingResult,
     TopicReconstructionResult,
+    ValidationCheckResult,
     WorkbookInventory,
 )
 from processing.topic_calculator import calculate_percentages, calculate_topic_case_metrics, calculate_topic_event_metrics
@@ -33,6 +38,33 @@ from validation.calculation_validator import assemble_validation_report, build_m
 from validation.input_validator import check_footer_detection, check_header_detection, check_input_files_present, check_workbook_identification
 from validation.mapping_validator import check_case_event_join, check_independent_topic_reconstruction, check_topic_criteria_matching
 from validation.reconciliation import build_benchmark_report
+
+
+def run_extraction_review(run_id: str, document_structure: DocumentStructure, workbook_inventory: WorkbookInventory,
+                            metric_results: list[MetricResult], provider_factory=None,
+                            trace_sink=None) -> list[ExtractionReviewFinding]:
+    """Advisory-only completeness review (see agents.extraction_review_agent):
+    flags signs that extraction may have missed something, without ever
+    being able to fail the run itself -- see _review_findings_to_checks."""
+    agent = ExtractionReviewAgent(provider_factory=provider_factory, trace_sink=trace_sink)
+    return agent.run(run_id, document_structure, workbook_inventory, metric_results)
+
+
+def _review_findings_to_checks(findings: list[ExtractionReviewFinding]) -> list[ValidationCheckResult]:
+    """Converts review findings into ValidationCheckResult entries capped
+    at status 'warning' -- never 'fail' -- so this advisory layer can
+    surface in the ValidationReport without ever flipping overall_status
+    to 'failed' on its own (assemble_validation_report only does that when
+    some check's status == 'fail')."""
+    return [
+        ValidationCheckResult(
+            check_name="extraction_completeness_review",
+            status="pass" if f.severity == "info" else "warning",
+            message=f.message,
+            evidence={"pbrer_section_number": f.pbrer_section_number, "topic_heading": f.topic_heading},
+        )
+        for f in findings
+    ]
 
 
 def recompute_from_topic_mapping(result: dict[str, Any], new_mapping: TopicMappingResult) -> dict[str, Any]:
@@ -64,6 +96,9 @@ def recompute_from_topic_mapping(result: dict[str, Any], new_mapping: TopicMappi
         engine_output["topic_case_counts"],
     )
 
+    review_findings = run_extraction_review(run_id, document_structure, workbook_inventory, metric_results,
+                                              provider_factory=build_provider_factory())
+
     extra_checks = []
     extra_checks.extend(check_workbook_identification(workbook_inventory))
     extra_checks.extend(check_header_detection(workbook_inventory))
@@ -71,12 +106,14 @@ def recompute_from_topic_mapping(result: dict[str, Any], new_mapping: TopicMappi
     extra_checks.extend(check_topic_criteria_matching(new_mapping.mappings))
     extra_checks.extend(engine_output["case_event_join_checks"])
     extra_checks.extend(check_independent_topic_reconstruction(r) for r in reconstruction_results)
+    extra_checks.extend(_review_findings_to_checks(review_findings))
     validation_report = assemble_validation_report(run_id, metric_results, extra_checks)
 
     result = dict(result)
     result.update({
         "topic_mapping": new_mapping, "execution_plan": execution_plan, "metric_results": metric_results,
         "benchmark_report": benchmark_report, "topic_reconstruction": reconstruction_results,
+        "extraction_review": review_findings,
         "validation_report": validation_report, "generated_at": datetime.now(UTC),
     })
     return result
@@ -361,6 +398,9 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
         engine_output["topic_case_counts"],
     )
 
+    review_findings = run_extraction_review(run_id, document_structure, workbook_inventory, metric_results,
+                                              provider_factory=provider_factory, trace_sink=trace_sink)
+
     discovered_excel_files = discover_excel_files(excel_dir)
     extra_checks = []
     extra_checks.append(check_input_files_present(docx_path, excel_dir, discovered_excel_files))
@@ -370,6 +410,7 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
     extra_checks.extend(check_topic_criteria_matching(topic_mapping.mappings))
     extra_checks.extend(engine_output["case_event_join_checks"])
     extra_checks.extend(check_independent_topic_reconstruction(r) for r in reconstruction_results)
+    extra_checks.extend(_review_findings_to_checks(review_findings))
 
     validation_report = assemble_validation_report(run_id, metric_results, extra_checks)
 
@@ -383,6 +424,7 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
         "metric_results": metric_results,
         "benchmark_report": benchmark_report,
         "topic_reconstruction": reconstruction_results,
+        "extraction_review": review_findings,
         "validation_report": validation_report,
         # Retained so the frontend can re-run just the planning/calculation
         # stages (e.g. after a manual topic-mapping correction) without

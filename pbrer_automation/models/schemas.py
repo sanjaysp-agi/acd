@@ -262,6 +262,17 @@ class BenchmarkReport(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Extraction Completeness Review Agent output (advisory only -- severity is
+# capped to info/warning so this layer can never fail a run on its own).
+# ---------------------------------------------------------------------------
+class ExtractionReviewFinding(BaseModel):
+    severity: Literal["info", "warning"] = "info"
+    pbrer_section_number: str | None = None
+    topic_heading: str | None = None
+    message: str
+
+
+# ---------------------------------------------------------------------------
 # Independent topic reconstruction / cross-validation (prompt.md Part 2
 # Agent 3 lines 378-394; Part 5 mandatory check #13)
 # ---------------------------------------------------------------------------

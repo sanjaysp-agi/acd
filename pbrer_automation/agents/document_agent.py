@@ -21,26 +21,19 @@ from pathlib import Path
 from typing import Any
 
 from agents.base import ToolCallingAgent
+from config.settings import settings
 from llm.local_provider import LocalDeterministicProvider
 from llm.provider import AgentStep, ToolSpec
 from models.schemas import AgentWarning, DocumentStructure, DocumentTopic
 from tools import document_tools as dtools
 
-# Candidate titles for the PBRER section that contains topic-level safety
-# evaluations. This is domain configuration for "what we are looking for
-# in a PBRER" (this application's whole purpose), not a guess about one
-# tenant's wording -- multiple phrasings are tried because different
-# PBRER templates/versions word this heading slightly differently.
-TARGET_SECTION_TITLE_CANDIDATES = [
-    "Evaluation of Risks and New Information",
-    "Signal and Risk Evaluation",
-]
-
-# The leaf topics we want metrics for sit two levels below the target
-# section header (16.3 -> 16.3.1 "New information on important identified
-# risks" -> 16.3.1.1 "Cardiac failure"). This depth is a template
-# convention, applied generically rather than hardcoding topic names.
-LEAF_TOPIC_DEPTH_BELOW_TARGET = 2
+# What counts as "the Section 16.3-equivalent topic catalogue" is
+# deployment-level configuration (config.settings.DocumentAgentSettings),
+# not a literal assumption baked into this module -- see its docstring for
+# why both the candidate titles and the leaf-topic depth are overridable
+# per tenant/template without a code change.
+TARGET_SECTION_TITLE_CANDIDATES = list(settings.document_agent.target_section_title_candidates)
+LEAF_TOPIC_DEPTH_BELOW_TARGET = settings.document_agent.leaf_topic_depth_below_target
 
 
 def _bind_file_path(fn, real_path: str):
@@ -104,41 +97,23 @@ def build_document_tool_specs(file_path: str) -> list[ToolSpec]:
 
 DOCUMENT_AGENT_SYSTEM_PROMPT = (
     "You are the Document Understanding Agent in a PBRER automation system. "
-    "You investigate the previous/approved PBRER Word document using only the "
-    "predefined tools provided. Never assume a specific heading style name or "
-    "that section numbers are literal text -- detect the actual convention this "
-    "document uses, reconstruct numbering, and locate the Section 16.3-equivalent "
-    "topic catalogue by content, not by assumed numbering.\n\n"
-    "You MUST complete this full procedure before giving your final answer -- "
-    "do not stop early just because you feel you have enough context:\n"
-    "1. Call detect_headings to get the document's headings and which "
-    "detection strategy worked.\n"
-    "2. Call exclude_front_matter_headings on those headings.\n"
-    "3. Call reconstruct_section_numbers on the kept headings.\n"
-    "4. Call locate_target_section with candidate_title_patterns = "
-    "[\"Evaluation of Risks and New Information\", \"Signal and Risk Evaluation\"].\n"
-    "5. If found, call calibrate_section_numbers to try to confirm the absolute "
-    "section number (not required to succeed, but must be attempted).\n"
-    "6. Call extract_topic_subtree for every descendant heading under the "
-    "target section.\n"
-    "7. The LEAF topics you must produce one result per are the headings "
-    "exactly 2 levels deeper than the target section's own level.\n"
-    "8. For EACH leaf topic, in turn: call extract_tables_near_heading (file_path, "
-    "that topic's block_index, and the next heading's block_index in document "
-    "order, or null if it's the last one), then call parse_topic_historical_metrics "
-    "on the returned tables/paragraphs. Do this for every single leaf topic -- "
-    "never skip any or stop after only some of them.\n"
-    "9. Only once every leaf topic has been processed, STOP calling tools and "
-    "respond with your final answer as plain JSON text (not a tool call -- "
-    "there is no tool named 'final') in exactly this shape: "
-    "{\"structure\": {\"run_id\": \"\", \"generated_at\": <ISO timestamp>, "
-    "\"document_file_name\": <basename>, \"target_section_title\": <text or \"\">, "
-    "\"target_section_located\": <bool>, \"heading_style_strategy\": <string>, "
-    "\"topics\": [{\"section_number\": ..., \"section_number_confidence\": ..., "
-    "\"title\": ..., \"level\": ..., \"historical_metrics\": {...}, "
-    "\"raw_table_rows\": [...], \"source_paragraph_index\": ...}, ...], "
-    "\"warnings\": [...]}} -- one entry per leaf topic, using the REAL tool "
-    "results you gathered, never invented numbers."
+    "Investigate the previous/approved PBRER narrative document using only the "
+    "tools provided. Never assume a heading style, a numbering convention, or "
+    "that the target section is literally \"16.3\" -- detect what this document "
+    "actually uses and locate the topic catalogue by heading content.\n\n"
+    "Complete this procedure in full, never stopping early or skipping a topic:\n"
+    "1. detect_headings, then exclude_front_matter_headings, then "
+    "reconstruct_section_numbers, in that order.\n"
+    f"2. locate_target_section with candidate_title_patterns = {TARGET_SECTION_TITLE_CANDIDATES!r}.\n"
+    "3. If found, attempt calibrate_section_numbers (confirmation is not "
+    "required to succeed, but must be attempted).\n"
+    "4. extract_topic_subtree under the target section; its leaf topics are "
+    f"the headings exactly {LEAF_TOPIC_DEPTH_BELOW_TARGET} level(s) deeper than it.\n"
+    "5. For every leaf topic: extract_tables_near_heading, then "
+    "parse_topic_historical_metrics on its result. Do this for each one.\n\n"
+    "Once every leaf topic is processed, stop calling tools and reply with a "
+    "brief confirmation -- the final structured result is reconstructed from "
+    "your actual tool calls, not from this text."
 )
 
 
