@@ -223,8 +223,14 @@ def detect_header_row(sheet_inspection: dict[str, Any], min_columns: int = 2) ->
     values, NOT covered by a wide merge (which indicates a title banner),
     and followed by several rows that each populate a similar number of
     columns (indicating a real data region starts right after it)."""
-    head_rows = sheet_inspection["head_rows"]
-    merge_by_row = sheet_inspection.get("merge_by_row", {})
+    # Row-number keys survive a round trip through this process's own
+    # memory as ints (local-deterministic mode), but a real LLM provider
+    # only ever sees `sheet_inspection` after it's been through JSON (which
+    # has no integer-key concept -- object keys are always strings), and
+    # reconstructs it the same way when passing it back as this tool's
+    # argument. Normalize defensively so both paths behave identically.
+    head_rows = {int(k): v for k, v in sheet_inspection["head_rows"].items()}
+    merge_by_row = {int(k): v for k, v in sheet_inspection.get("merge_by_row", {}).items()}
     max_col = sheet_inspection["max_col"]
     candidates = []
 

@@ -43,43 +43,61 @@ TARGET_SECTION_TITLE_CANDIDATES = [
 LEAF_TOPIC_DEPTH_BELOW_TARGET = 2
 
 
-def build_document_tool_specs() -> list[ToolSpec]:
+def _bind_file_path(fn, real_path: str):
+    """Wraps a tool fn so `file_path` is always the real, known-good path,
+    regardless of what a model-driven provider passes for it. A real LLM is
+    only ever told the document's basename (never the full local path, for
+    trace/privacy reasons -- see DocumentUnderstandingAgent.run), so it
+    cannot reliably supply a correct file_path itself; local-deterministic
+    mode already gets this for free via the policy closure below."""
+    def wrapped(**kwargs):
+        kwargs["file_path"] = real_path
+        return fn(**kwargs)
+    return wrapped
+
+
+def build_document_tool_specs(file_path: str) -> list[ToolSpec]:
     return [
         ToolSpec("inspect_document_metadata", "Report paragraph/table counts and style usage.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}}},
-                 dtools.inspect_document_metadata, "python-docx"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+                 _bind_file_path(dtools.inspect_document_metadata, file_path), "python-docx"),
         ToolSpec("sample_paragraph_styles", "Sample text per distinct paragraph style.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}}},
-                 dtools.sample_paragraph_styles, "python-docx"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+                 _bind_file_path(dtools.sample_paragraph_styles, file_path), "python-docx"),
         ToolSpec("detect_headings", "Detect headings via style-name/outline-level/bold heuristics.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}}},
-                 dtools.detect_headings, "python-docx"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+                 _bind_file_path(dtools.detect_headings, file_path), "python-docx"),
         ToolSpec("exclude_front_matter_headings", "Drop leading unnumbered front-matter headings.",
-                 {"type": "object", "properties": {"headings": {"type": "array"}}},
+                 {"type": "object", "properties": {"headings": {"type": "array"}}, "required": ["headings"]},
                  dtools.exclude_front_matter_headings, "python"),
         ToolSpec("reconstruct_section_numbers", "Assign relative dotted numbers via sibling counting.",
-                 {"type": "object", "properties": {"headings": {"type": "array"}}},
+                 {"type": "object", "properties": {"headings": {"type": "array"}}, "required": ["headings"]},
                  dtools.reconstruct_section_numbers, "python"),
         ToolSpec("locate_target_section", "Find the heading matching known PBRER section titles.",
                  {"type": "object", "properties": {"headings_with_numbers": {"type": "array"},
-                                                     "candidate_title_patterns": {"type": "array"}}},
+                                                     "candidate_title_patterns": {"type": "array"}},
+                  "required": ["headings_with_numbers", "candidate_title_patterns"]},
                  dtools.locate_target_section, "python"),
         ToolSpec("calibrate_section_numbers", "Try to confirm the absolute section number via citations.",
                  {"type": "object", "properties": {"file_path": {"type": "string"},
                                                      "target_heading_text": {"type": "string"},
-                                                     "target_relative_number": {"type": "string"}}},
-                 dtools.calibrate_section_numbers, "python-docx"),
+                                                     "target_relative_number": {"type": "string"}},
+                  "required": ["file_path", "target_heading_text", "target_relative_number"]},
+                 _bind_file_path(dtools.calibrate_section_numbers, file_path), "python-docx"),
         ToolSpec("extract_topic_subtree", "Get all descendant headings of the target section.",
                  {"type": "object", "properties": {"headings_with_numbers": {"type": "array"},
-                                                     "target_block_index": {"type": "integer"}}},
+                                                     "target_block_index": {"type": "integer"}},
+                  "required": ["headings_with_numbers", "target_block_index"]},
                  dtools.extract_topic_subtree, "python"),
         ToolSpec("extract_tables_near_heading", "Collect tables/paragraphs between two headings.",
                  {"type": "object", "properties": {"file_path": {"type": "string"},
                                                      "heading_block_index": {"type": "integer"},
-                                                     "next_heading_block_index": {"type": ["integer", "null"]}}},
-                 dtools.extract_tables_near_heading, "python-docx"),
+                                                     "next_heading_block_index": {"type": ["integer", "null"]}},
+                  "required": ["file_path", "heading_block_index", "next_heading_block_index"]},
+                 _bind_file_path(dtools.extract_tables_near_heading, file_path), "python-docx"),
         ToolSpec("parse_topic_historical_metrics", "Extract structured numbers from a topic's table/paragraphs.",
-                 {"type": "object", "properties": {"table_rows": {"type": "array"}, "paragraphs": {"type": "array"}}},
+                 {"type": "object", "properties": {"table_rows": {"type": "array"}, "paragraphs": {"type": "array"}},
+                  "required": ["table_rows", "paragraphs"]},
                  dtools.parse_topic_historical_metrics, "python"),
     ]
 
@@ -90,7 +108,37 @@ DOCUMENT_AGENT_SYSTEM_PROMPT = (
     "predefined tools provided. Never assume a specific heading style name or "
     "that section numbers are literal text -- detect the actual convention this "
     "document uses, reconstruct numbering, and locate the Section 16.3-equivalent "
-    "topic catalogue by content, not by assumed numbering."
+    "topic catalogue by content, not by assumed numbering.\n\n"
+    "You MUST complete this full procedure before giving your final answer -- "
+    "do not stop early just because you feel you have enough context:\n"
+    "1. Call detect_headings to get the document's headings and which "
+    "detection strategy worked.\n"
+    "2. Call exclude_front_matter_headings on those headings.\n"
+    "3. Call reconstruct_section_numbers on the kept headings.\n"
+    "4. Call locate_target_section with candidate_title_patterns = "
+    "[\"Evaluation of Risks and New Information\", \"Signal and Risk Evaluation\"].\n"
+    "5. If found, call calibrate_section_numbers to try to confirm the absolute "
+    "section number (not required to succeed, but must be attempted).\n"
+    "6. Call extract_topic_subtree for every descendant heading under the "
+    "target section.\n"
+    "7. The LEAF topics you must produce one result per are the headings "
+    "exactly 2 levels deeper than the target section's own level.\n"
+    "8. For EACH leaf topic, in turn: call extract_tables_near_heading (file_path, "
+    "that topic's block_index, and the next heading's block_index in document "
+    "order, or null if it's the last one), then call parse_topic_historical_metrics "
+    "on the returned tables/paragraphs. Do this for every single leaf topic -- "
+    "never skip any or stop after only some of them.\n"
+    "9. Only once every leaf topic has been processed, STOP calling tools and "
+    "respond with your final answer as plain JSON text (not a tool call -- "
+    "there is no tool named 'final') in exactly this shape: "
+    "{\"structure\": {\"run_id\": \"\", \"generated_at\": <ISO timestamp>, "
+    "\"document_file_name\": <basename>, \"target_section_title\": <text or \"\">, "
+    "\"target_section_located\": <bool>, \"heading_style_strategy\": <string>, "
+    "\"topics\": [{\"section_number\": ..., \"section_number_confidence\": ..., "
+    "\"title\": ..., \"level\": ..., \"historical_metrics\": {...}, "
+    "\"raw_table_rows\": [...], \"source_paragraph_index\": ...}, ...], "
+    "\"warnings\": [...]}} -- one entry per leaf topic, using the REAL tool "
+    "results you gathered, never invented numbers."
 )
 
 
@@ -255,13 +303,113 @@ class _DocumentPolicyState:
         return AgentStep(type="final", final_output={"structure": output.model_dump(mode="json")})
 
 
+def _latest_result(tool_calls: list, tool_name: str) -> Any:
+    for record in reversed(tool_calls):
+        if record.tool_name == tool_name and not record.result_summary.startswith("ERROR:"):
+            return record.raw_result
+    return None
+
+
+def _assemble_document_structure(file_path: str | Path, tool_calls: list) -> dict[str, Any]:
+    """Builds the structure fields from the REAL tool-call records, never
+    from a model-driven provider's own hand-typed final JSON answer (which
+    was observed, empirically, to come back wrapped in markdown fences,
+    with drifted field names, or simply as empty/invalid JSON). The
+    model's only real job is deciding which tool to call next and with
+    what arguments -- for local-deterministic mode this reproduces
+    _DocumentPolicyState's own assembly exactly, since it's driven by the
+    same deterministic sequence of real tool calls; for Bedrock it makes
+    the result robust to however the model phrases its own summary."""
+    warnings: list[AgentWarning] = []
+
+    detect_result = _latest_result(tool_calls, "detect_headings") or {}
+    heading_strategy = detect_result.get("strategy", "")
+    if not detect_result.get("headings"):
+        warnings.append(AgentWarning(code="no_headings_detected", severity="critical",
+                                      message="No headings could be detected in the document."))
+
+    front_matter_result = _latest_result(tool_calls, "exclude_front_matter_headings")
+    excluded = (front_matter_result or {}).get("excluded_front_matter", [])
+    if excluded:
+        warnings.append(AgentWarning(
+            code="front_matter_excluded", severity="info",
+            message=f"Excluded {len(excluded)} front-matter heading(s) before numbering: "
+                    f"{[h['text'] for h in excluded]}"))
+
+    locate_result = _latest_result(tool_calls, "locate_target_section") or {}
+    target = locate_result.get("heading") if locate_result.get("found") else None
+    if target is None:
+        warnings.append(AgentWarning(
+            code="target_section_not_found", severity="critical",
+            message=f"Could not locate any heading matching {TARGET_SECTION_TITLE_CANDIDATES}."))
+
+    topics_out: list[DocumentTopic] = []
+    if target is not None:
+        target = dict(target)
+        calibration = _latest_result(tool_calls, "calibrate_section_numbers") or {}
+        target["absolute_number"] = calibration.get("absolute_number")
+        target["calibration_confidence"] = calibration.get("confidence", 0.0)
+        if not calibration.get("absolute_number"):
+            warnings.append(AgentWarning(
+                code="section_number_unconfirmed", severity="warning",
+                message=f"Could not independently confirm the absolute section number for "
+                        f"'{target['text']}' (relative: {target['relative_number']}). "
+                        f"Evidence: {calibration.get('evidence')}"))
+
+        subtree = _latest_result(tool_calls, "extract_topic_subtree") or []
+        leaf_level = target["level"] + LEAF_TOPIC_DEPTH_BELOW_TARGET
+        leaf_topics = [h for h in subtree if h["level"] == leaf_level]
+        if not leaf_topics:
+            warnings.append(AgentWarning(
+                code="no_leaf_topics_found", severity="warning",
+                message=f"No headings found at depth {leaf_level} under the target section; "
+                        "topic catalogue may be incomplete."))
+
+        extract_calls = [r for r in tool_calls if r.tool_name == "extract_tables_near_heading"
+                          and not r.result_summary.startswith("ERROR:")]
+        for topic in leaf_topics:
+            block_index = topic["block_index"]
+            matching = [r for r in extract_calls if r.arguments_redacted.get("heading_block_index") == block_index]
+            if not matching:
+                warnings.append(AgentWarning(
+                    code="topic_table_not_extracted", severity="warning",
+                    message=f"No extract_tables_near_heading call found for topic '{topic['text']}'."))
+                continue
+            extract_record = matching[-1]  # last attempt wins if the model retried
+            extract_idx = tool_calls.index(extract_record)
+            metrics: dict[str, Any] = {}
+            for later in tool_calls[extract_idx + 1:]:
+                if later.tool_name == "parse_topic_historical_metrics" and not later.result_summary.startswith("ERROR:"):
+                    metrics = later.raw_result or {}
+                    break
+                if later.tool_name == "extract_tables_near_heading":
+                    break  # moved on to another topic without a metrics call for this one
+            table_rows = [row for t in (extract_record.raw_result or {}).get("tables", []) for row in t.get("rows", [])]
+            topics_out.append(DocumentTopic(
+                section_number=topic.get("absolute_number") or topic["relative_number"],
+                section_number_confidence=topic.get("calibration_confidence", 0.3 if not topic.get("absolute_number") else 0.0),
+                title=topic["text"], level=topic["level"],
+                historical_metrics={k: v for k, v in metrics.items() if v is not None},
+                raw_table_rows=table_rows,
+                source_paragraph_index=topic["block_index"],
+            ))
+
+    return {
+        "document_file_name": Path(file_path).name,
+        "target_section_title": target["text"] if target else "",
+        "target_section_located": target is not None,
+        "heading_style_strategy": heading_strategy,
+        "topics": [t.model_dump(mode="json") for t in topics_out],
+        "warnings": [w.model_dump(mode="json") for w in warnings],
+    }
+
+
 class DocumentUnderstandingAgent:
     agent_name = "document_understanding_agent"
 
     def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None):
         from config.settings import settings
 
-        self.tool_specs = build_document_tool_specs()
         self.trace_sink = trace_sink
         self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self._provider_factory = provider_factory
@@ -295,20 +443,20 @@ class DocumentUnderstandingAgent:
 
         provider = (self._provider_factory(policy) if self._provider_factory
                     else LocalDeterministicProvider(policy))
-        runner = ToolCallingAgent(provider, self.tool_specs, max_iterations=self.max_iterations,
+        tool_specs = build_document_tool_specs(str(file_path))
+        runner = ToolCallingAgent(provider, tool_specs, max_iterations=self.max_iterations,
                                    trace_sink=self.trace_sink)
         runner.agent_name = self.agent_name
         result = runner.run(run_id, DOCUMENT_AGENT_SYSTEM_PROMPT, f"Investigate PBRER document: {Path(file_path).name}")
 
-        structure_dict = result.output.get("structure")
-        if structure_dict is None:
-            return DocumentStructure(
-                run_id=run_id, generated_at=datetime.now(UTC), document_file_name=Path(file_path).name,
-                target_section_title="", target_section_located=False,
-                warnings=[AgentWarning(code="agent_failed", severity="critical",
-                                        message="Document Understanding Agent did not reach a final answer.")],
-            )
-        if cache is not None:
+        structure_dict = _assemble_document_structure(file_path, result.tool_calls)
+        structure_dict["warnings"] = [w.model_dump(mode="json") for w in result.warnings] + structure_dict["warnings"]
+        # Only cache a run that actually reached a final step -- a
+        # max-iterations/provider-error failure (result.status == "failed")
+        # should be retried on the next run against this same file, not
+        # permanently locked in.
+        if cache is not None and result.status == "completed":
             cache.put("document", file_path, structure_dict)
         structure_dict["run_id"] = run_id
+        structure_dict["generated_at"] = datetime.now(UTC).isoformat()
         return DocumentStructure.model_validate(structure_dict)

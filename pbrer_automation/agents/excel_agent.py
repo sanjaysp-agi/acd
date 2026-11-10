@@ -272,40 +272,223 @@ class _WorkbookPolicyState:
         return AgentStep(type="final", final_output={"entry": entry.model_dump(mode="json")})
 
 
-def build_excel_tool_specs() -> list[ToolSpec]:
+def _latest_result(tool_calls: list, tool_name: str) -> Any:
+    for record in reversed(tool_calls):
+        if record.tool_name == tool_name and not record.result_summary.startswith("ERROR:"):
+            return record.raw_result
+    return None
+
+
+def _latest_result_for_sheet(tool_calls: list, tool_name: str, sheet_name: str, via: str = "sheet_name") -> Any:
+    """Like _latest_result, but scoped to calls that were actually about
+    THIS sheet. `via="sheet_name"` matches tools that take sheet_name
+    directly as an argument; `via="sheet_inspection"` matches
+    detect_header_row, whose only argument is the nested sheet_inspection
+    object (which itself carries the real sheet_name -- see
+    tools.excel_tools.inspect_sheet's return shape)."""
+    for record in reversed(tool_calls):
+        if record.tool_name != tool_name or record.result_summary.startswith("ERROR:"):
+            continue
+        if via == "sheet_inspection":
+            nested = record.arguments_redacted.get("sheet_inspection") or {}
+            if nested.get("sheet_name") == sheet_name:
+                return record.raw_result
+        elif record.arguments_redacted.get("sheet_name") == sheet_name:
+            return record.raw_result
+    return None
+
+
+def _latest_result_matching_arg(tool_calls: list, tool_name: str, arg_name: str, arg_value: Any) -> Any:
+    """Matches a tool call by CONTENT equality on one argument, for tools
+    with no sheet-identifying key at all (map_columns_to_schema,
+    detect_date_formats) -- correlates by the same `columns`/`sample_values`
+    list that uniquely identifies which sheet/column it was really about."""
+    for record in reversed(tool_calls):
+        if record.tool_name != tool_name or record.result_summary.startswith("ERROR:"):
+            continue
+        if record.arguments_redacted.get(arg_name) == arg_value:
+            return record.raw_result
+    return None
+
+
+def _assemble_workbook_entry(file_path: str, file_name: str, tool_calls: list) -> tuple[dict[str, Any], list]:
+    """Builds the WorkbookInventoryEntry fields from the REAL tool-call
+    records, never from a model-driven provider's own hand-typed final
+    JSON (see agents.document_agent._assemble_document_structure for the
+    same rationale). Every sub-result here (inspect_sheet, profile_columns,
+    classify_workbook, ...) is itself a deterministic Python function --
+    the only real risk is correctly pairing which result belongs to which
+    sheet, which this does by matching on the real arguments each call was
+    actually made with, not by trusting the model's bookkeeping."""
+    warnings: list[AgentWarning] = []
+
+    inspect_wb = _latest_result(tool_calls, "inspect_workbook") or {}
+    sheet_names = [s["sheet_name"] for s in inspect_wb.get("sheets", [])]
+    if not sheet_names:
+        warnings.append(AgentWarning(code="workbook_inspect_failed", severity="critical",
+                                      message=f"Could not inspect {file_name}: no sheets found."))
+
+    sheet_results: dict[str, SheetInspection] = {}
+    cover_page_criteria: CoverPageCriterion | None = None
+    column_mappings: list[dict[str, Any]] = []
+
+    for sheet_name in sheet_names:
+        sheet_inspection = _latest_result_for_sheet(tool_calls, "inspect_sheet", sheet_name)
+        if sheet_inspection is None:
+            continue  # this sheet was never actually investigated
+        role = _guess_sheet_role(sheet_inspection)
+
+        if role == "cover_page":
+            cp_raw = _latest_result_for_sheet(tool_calls, "extract_cover_page_criteria", sheet_name) or {}
+            cover_page_criteria = CoverPageCriterion(
+                criterion_type=CriterionType(cp_raw.get("criterion_type", "unknown")),
+                criterion_value=cp_raw.get("criterion_value"),
+                raw_fields=cp_raw.get("raw_fields", {}),
+            )
+            sheet_results[sheet_name] = SheetInspection(
+                sheet_name=sheet_name, role="cover_page",
+                detection_evidence=["classified as cover page by structural heuristic"],
+            )
+            continue
+
+        header_result = _latest_result_for_sheet(tool_calls, "detect_header_row", sheet_name, via="sheet_inspection") or {}
+        header_row = header_result.get("header_row")
+        if header_row is None:
+            warnings.append(AgentWarning(code="header_not_found", severity="critical",
+                                          message=f"No viable header row found in {sheet_name} of {file_name}."))
+            sheet_results[sheet_name] = SheetInspection(sheet_name=sheet_name, role="unknown",
+                                                         detection_evidence=["header detection failed"])
+            continue
+
+        data_region = _latest_result_for_sheet(tool_calls, "detect_data_region", sheet_name) or {}
+        columns = data_region.get("columns", [])
+        footer_info = _latest_result_for_sheet(tool_calls, "detect_footer_rows", sheet_name) or {}
+        profiles = _latest_result_for_sheet(tool_calls, "profile_columns", sheet_name) or []
+        mappings = _latest_result_matching_arg(tool_calls, "map_columns_to_schema", "columns", columns) or []
+        if not mappings and profiles:
+            # Fall back to matching on column_profiles instead, in case the
+            # model's `columns` echo drifted slightly (e.g. reordering).
+            mappings = _latest_result_matching_arg(tool_calls, "map_columns_to_schema", "column_profiles", profiles) or []
+
+        for m in mappings:
+            if m.get("needs_review"):
+                warnings.append(AgentWarning(
+                    code="low_confidence_mapping", severity="warning",
+                    message=f"Column '{m['raw_column']}' in {sheet_name} ({file_name}) "
+                            f"needs review: {m.get('evidence')}"))
+        column_mappings = mappings
+
+        data_end_row = footer_info.get("effective_last_data_row")
+        column_profiles = [ColumnProfile(**p) for p in profiles]
+
+        date_mapping = next((m for m in mappings
+                              if m.get("canonical_field") == CanonicalField.INITIAL_APPROVAL_DATE.value), None)
+        if date_mapping:
+            profile = next((p for p in profiles if p["column_name"] == date_mapping["raw_column"]), None)
+            if profile is not None:
+                detection = _latest_result_matching_arg(
+                    tool_calls, "detect_date_formats", "sample_values", profile.get("sample_values", [])) or {}
+                if detection.get("format"):
+                    for p in column_profiles:
+                        if p.column_name == date_mapping["raw_column"]:
+                            p.possible_date_format = detection["format"]
+                            break
+                if detection.get("confidence", 1.0) < 0.6:
+                    warnings.append(AgentWarning(
+                        code="ambiguous_date_format", severity="warning",
+                        message=f"Date column '{date_mapping['raw_column']}' in {sheet_name} ({file_name}) has an "
+                                f"ambiguous detected format ({detection.get('format')}, "
+                                f"confidence {detection.get('confidence')}) -- requires review."))
+
+        sheet_results[sheet_name] = SheetInspection(
+            sheet_name=sheet_name, role="data_table",
+            header_row=header_row, data_start_row=(header_row or 0) + 1,
+            data_end_row=data_end_row,
+            footer_rows=footer_info.get("footer_rows", []),
+            row_count=(data_end_row - (header_row or 0)) if data_end_row else None,
+            columns=columns, column_profiles=column_profiles,
+            detection_evidence=[f"header_row={header_row}"],
+        )
+
+    data_sheet = next((s for s in sheet_results.values() if s.role == "data_table"), None)
+    classify_columns = data_sheet.columns if data_sheet else []
+    criterion_value = cover_page_criteria.criterion_value if cover_page_criteria else None
+    classification = (
+        _latest_result_matching_arg(tool_calls, "classify_workbook", "columns", classify_columns)
+        or _latest_result(tool_calls, "classify_workbook")
+        or {"workbook_type": "unclassified", "confidence": 0.0, "evidence": ["classify_workbook never ran"],
+            "data_grain": "unknown"}
+    )
+
+    entry = {
+        "file_name": file_name,
+        "file_path": file_path,
+        "workbook_type": classification["workbook_type"],
+        "classification_confidence": classification["confidence"],
+        "classification_evidence": classification["evidence"],
+        "sheets": [s.model_dump(mode="json") for s in sheet_results.values()],
+        "cover_page_criteria": cover_page_criteria.model_dump(mode="json") if cover_page_criteria else None,
+        "data_grain": classification["data_grain"],
+        "column_mappings": column_mappings,
+    }
+    return entry, warnings
+
+
+def _bind_file_path(fn, real_path: str):
+    """Wraps a tool fn so `file_path` is always the real, known-good path
+    for THIS workbook, regardless of what a model-driven provider passes.
+    A real LLM is only ever told the workbook's basename, not its full
+    local path, so it cannot reliably supply file_path itself; local-
+    deterministic mode already gets this for free via the policy closure
+    in _WorkbookPolicyState."""
+    def wrapped(**kwargs):
+        kwargs["file_path"] = real_path
+        return fn(**kwargs)
+    return wrapped
+
+
+def build_excel_tool_specs(file_path: str) -> list[ToolSpec]:
     return [
         ToolSpec("inspect_workbook", "Open a workbook; list its sheets, sizes, merges.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}}}, et.inspect_workbook, "openpyxl"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+                 _bind_file_path(et.inspect_workbook, file_path), "openpyxl"),
         ToolSpec("inspect_sheet", "Read raw cell values/merges for a sheet.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"}}},
-                 et.inspect_sheet, "openpyxl"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"}},
+                  "required": ["file_path", "sheet_name"]},
+                 _bind_file_path(et.inspect_sheet, file_path), "openpyxl"),
         ToolSpec("detect_header_row", "Score candidate header rows from a sheet inspection.",
-                 {"type": "object", "properties": {"sheet_inspection": {"type": "object"}}},
+                 {"type": "object", "properties": {"sheet_inspection": {"type": "object"}}, "required": ["sheet_inspection"]},
                  et.detect_header_row, "openpyxl+pandas"),
         ToolSpec("detect_data_region", "Load the sheet with the detected header to get real columns/row count.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"},
-                                                     "header_row": {"type": "integer"}}},
-                 et.detect_data_region, "pandas"),
+                                                     "header_row": {"type": "integer"}},
+                  "required": ["file_path", "sheet_name", "header_row"]},
+                 _bind_file_path(et.detect_data_region, file_path), "pandas"),
         ToolSpec("detect_footer_rows", "Identify trailing footer/boilerplate rows to exclude.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"},
-                                                     "header_row": {"type": "integer"}}},
-                 et.detect_footer_rows, "pandas"),
+                                                     "header_row": {"type": "integer"}},
+                  "required": ["file_path", "sheet_name", "header_row"]},
+                 _bind_file_path(et.detect_footer_rows, file_path), "pandas"),
         ToolSpec("profile_columns", "Profile every column's type, samples, missing/invalid counts.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"},
-                                                     "header_row": {"type": "integer"}, "data_end_row": {"type": ["integer", "null"]}}},
-                 et.profile_columns, "pandas"),
+                                                     "header_row": {"type": "integer"}, "data_end_row": {"type": ["integer", "null"]}},
+                  "required": ["file_path", "sheet_name", "header_row", "data_end_row"]},
+                 _bind_file_path(et.profile_columns, file_path), "pandas"),
         ToolSpec("detect_date_formats", "Independently determine the likely date format for a candidate "
                  "date column from its raw sample values.",
-                 {"type": "object", "properties": {"sample_values": {"type": "array"}}},
+                 {"type": "object", "properties": {"sample_values": {"type": "array"}}, "required": ["sample_values"]},
                  et.detect_date_formats, "pandas"),
         ToolSpec("extract_cover_page_criteria", "Scan a cover-page sheet for label:value search criteria.",
-                 {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"}}},
-                 et.extract_cover_page_criteria, "openpyxl"),
+                 {"type": "object", "properties": {"file_path": {"type": "string"}, "sheet_name": {"type": "string"}},
+                  "required": ["file_path", "sheet_name"]},
+                 _bind_file_path(et.extract_cover_page_criteria, file_path), "openpyxl"),
         ToolSpec("classify_workbook", "Classify a workbook as all/topic case or drug-event.",
-                 {"type": "object", "properties": {"columns": {"type": "array"}, "cover_page_criterion_value": {"type": ["string", "null"]}}},
+                 {"type": "object", "properties": {"columns": {"type": "array"}, "cover_page_criterion_value": {"type": ["string", "null"]}},
+                  "required": ["columns", "cover_page_criterion_value"]},
                  et.classify_workbook, "python"),
         ToolSpec("map_columns_to_schema", "Map raw columns onto the canonical schema.",
-                 {"type": "object", "properties": {"columns": {"type": "array"}, "column_profiles": {"type": "array"}}},
+                 {"type": "object", "properties": {"columns": {"type": "array"}, "column_profiles": {"type": "array"}},
+                  "required": ["columns", "column_profiles"]},
                  et.map_columns_to_schema, "python"),
     ]
 
@@ -315,7 +498,31 @@ EXCEL_AGENT_SYSTEM_PROMPT = (
     "You investigate ONE Excel workbook at a time using only the predefined tools "
     "provided. Never assume a fixed sheet count, header row, or column set -- "
     "always inspect first, then decide. Classify the workbook's type and map its "
-    "columns onto the canonical schema, flagging anything uncertain for review."
+    "columns onto the canonical schema, flagging anything uncertain for review.\n\n"
+    "You MUST complete this full procedure for EVERY sheet before giving your "
+    "final answer -- do not stop early just because you feel you have enough context:\n"
+    "1. Call inspect_workbook to list every sheet.\n"
+    "2. For EACH sheet, in turn: call inspect_sheet, then decide from its "
+    "structure (narrow + few rows = cover page; wide + many rows = data table) "
+    "which it is.\n"
+    "   - If it's a cover page: call extract_cover_page_criteria on it.\n"
+    "   - If it's a data table: call detect_header_row (passing the exact "
+    "object inspect_sheet just returned as sheet_inspection), then "
+    "detect_data_region, then detect_footer_rows, then profile_columns, then "
+    "map_columns_to_schema. If one of the mapped columns is the initial-"
+    "approval-date field, also call detect_date_formats on its sample_values "
+    "to independently confirm the date format.\n"
+    "3. Only once every sheet above has been fully processed, call "
+    "classify_workbook using the data sheet's columns and the cover page's "
+    "criterion value (if any).\n"
+    "4. Only after classify_workbook returns, STOP calling tools and respond "
+    "with your final answer as plain JSON text (not a tool call -- there is "
+    "no tool named 'final') in exactly this shape: "
+    "{\"entry\": {\"file_name\": ..., \"file_path\": ..., \"workbook_type\": ..., "
+    "\"classification_confidence\": ..., \"classification_evidence\": [...], "
+    "\"sheets\": [...], \"cover_page_criteria\": {...} or null, \"data_grain\": ..., "
+    "\"column_mappings\": [...], \"warnings\": [...]}} using the REAL tool "
+    "results you gathered, never invented values."
 )
 
 
@@ -325,7 +532,6 @@ class ExcelUnderstandingAgent:
     def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None, max_workers: int = 10):
         from config.settings import settings
 
-        self.tool_specs = build_excel_tool_specs()
         self.trace_sink = trace_sink
         self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self.max_workers = max_workers
@@ -338,14 +544,16 @@ class ExcelUnderstandingAgent:
         with self._trace_lock:
             self.trace_sink(event)
 
-    def _make_runner(self, policy) -> ToolCallingAgent:
+    def _make_runner(self, policy, file_path: str) -> ToolCallingAgent:
         provider = (self._provider_factory(policy) if self._provider_factory
                     else LocalDeterministicProvider(policy))
-        # Each workbook gets its own ToolCallingAgent/provider/policy instance
-        # (all local to this call), so concurrent investigate_workbook() calls
-        # from different threads never share mutable state -- only the trace
-        # sink and the caller's `entries` list are shared, both guarded.
-        runner = ToolCallingAgent(provider, self.tool_specs, max_iterations=self.max_iterations,
+        # Each workbook gets its own ToolCallingAgent/provider/policy/tool_specs
+        # instance (all local to this call, tool_specs bound to THIS workbook's
+        # file_path), so concurrent investigate_workbook() calls from different
+        # threads never share mutable state -- only the trace sink and the
+        # caller's `entries` list are shared, both guarded.
+        tool_specs = build_excel_tool_specs(file_path)
+        runner = ToolCallingAgent(provider, tool_specs, max_iterations=self.max_iterations,
                                    trace_sink=self._thread_safe_trace_sink)
         runner.agent_name = self.agent_name
         return runner
@@ -378,11 +586,16 @@ class ExcelUnderstandingAgent:
                 return state.finalize_with_classification(last_result or {})
             return state.next_step(last_tool_name, last_result, error)
 
-        runner = self._make_runner(policy)
+        runner = self._make_runner(policy, file_path)
         result = runner.run(run_id, EXCEL_AGENT_SYSTEM_PROMPT,
                              f"Investigate workbook: {file_name}")
-        entry = result.output.get("entry")
-        if cache is not None and entry is not None:
+        entry, assembled_warnings = _assemble_workbook_entry(file_path, file_name, result.tool_calls)
+        entry["warnings"] = [w.model_dump(mode="json") for w in result.warnings + assembled_warnings]
+        # Only cache a run that both reached a final step AND actually
+        # investigated at least one sheet -- a max-iterations/provider-error
+        # failure (result.status == "failed") should be retried on the next
+        # run against this same file, not permanently locked in.
+        if cache is not None and result.status == "completed" and entry.get("sheets"):
             cache.put("workbook", file_path, entry)
         return {"agent_result": result, "entry": entry}
 
@@ -414,7 +627,9 @@ class ExcelUnderstandingAgent:
         entries = []
         for i in range(len(files)):  # preserve original discovery order, not completion order
             outcome = results_by_index.get(i) or {}
-            if outcome.get("entry"):
+            # Exclude a total-failure entry (no sheets ever investigated)
+            # rather than adding a useless "unclassified" placeholder.
+            if outcome.get("entry") and outcome["entry"].get("sheets"):
                 entries.append(WorkbookInventoryEntry.model_validate(outcome["entry"]))
 
         case_entries = [e.model_dump() for e in entries if e.workbook_type in (WorkbookType.ALL_CASE, WorkbookType.TOPIC_CASE)]

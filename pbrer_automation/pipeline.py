@@ -35,6 +35,53 @@ from validation.mapping_validator import check_case_event_join, check_independen
 from validation.reconciliation import build_benchmark_report
 
 
+def recompute_from_topic_mapping(result: dict[str, Any], new_mapping: TopicMappingResult) -> dict[str, Any]:
+    """Re-runs Calculation Planning + the calculation engine + benchmark +
+    reconstruction + validation using a human-corrected topic mapping,
+    WITHOUT re-running the Document/Excel Understanding Agents -- their
+    output doesn't change when a human corrects a topic<->workbook
+    pairing. `result` is a full `run_full_pipeline`-shaped dict with
+    `topic_mapping` already replaced by `new_mapping`."""
+    run_id = result["run_id"]
+    workbook_inventory = result["workbook_inventory"]
+    document_structure = result["document_structure"]
+    reporting_start = result["execution_plan"].reporting_start
+    reporting_end = result["execution_plan"].reporting_end
+    excel_dir = result["_excel_dir"]
+
+    from llm.factory import build_provider_factory
+
+    planner = CalculationPlanningAgent(provider_factory=build_provider_factory())
+    doc_topics = [t.model_dump(mode="json") for t in document_structure.topics]
+    execution_plan = planner.run(run_id, doc_topics, workbook_inventory, new_mapping, reporting_start, reporting_end)
+
+    topics_by_section = {t.section_number: t.model_dump(mode="json") for t in document_structure.topics}
+    engine_output = run_calculation_engine(execution_plan, workbook_inventory, topics_by_section, excel_dir)
+    metric_results = engine_output["metric_results"]
+    benchmark_report = build_benchmark_report(run_id, metric_results)
+    reconstruction_results = run_topic_reconstruction(
+        workbook_inventory, new_mapping, reporting_start, reporting_end, excel_dir,
+        engine_output["topic_case_counts"],
+    )
+
+    extra_checks = []
+    extra_checks.extend(check_workbook_identification(workbook_inventory))
+    extra_checks.extend(check_header_detection(workbook_inventory))
+    extra_checks.extend(check_footer_detection(workbook_inventory))
+    extra_checks.extend(check_topic_criteria_matching(new_mapping.mappings))
+    extra_checks.extend(engine_output["case_event_join_checks"])
+    extra_checks.extend(check_independent_topic_reconstruction(r) for r in reconstruction_results)
+    validation_report = assemble_validation_report(run_id, metric_results, extra_checks)
+
+    result = dict(result)
+    result.update({
+        "topic_mapping": new_mapping, "execution_plan": execution_plan, "metric_results": metric_results,
+        "benchmark_report": benchmark_report, "topic_reconstruction": reconstruction_results,
+        "validation_report": validation_report, "generated_at": datetime.now(UTC),
+    })
+    return result
+
+
 def _wb_lookup(workbook_inventory: WorkbookInventory) -> dict[str, Any]:
     return {wb.file_name: wb for wb in workbook_inventory.workbooks}
 
@@ -276,21 +323,30 @@ def run_calculation_engine(execution_plan: ExecutionPlan, workbook_inventory: Wo
 
 
 def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
-                        reporting_start: str, reporting_end: str, trace_sink=None) -> dict[str, Any]:
+                        reporting_start: str, reporting_end: str, trace_sink=None,
+                        provider_factory=None) -> dict[str, Any]:
     """Runs Document Agent -> Excel Agent -> Topic Mapping Agent ->
     Calculation Planning Agent -> deterministic calculation engine ->
     validation/benchmark, and returns every stage's output for the
-    frontend's traceability page."""
-    doc_agent = DocumentUnderstandingAgent(trace_sink=trace_sink)
+    frontend's traceability page.
+
+    `provider_factory` selects which ToolCallingProvider each agent uses
+    (defaults to `llm.factory.build_provider_factory()`, which reads
+    `settings.llm.provider` -- "local" unless PBRER_LLM_PROVIDER=bedrock)."""
+    if provider_factory is None:
+        from llm.factory import build_provider_factory
+        provider_factory = build_provider_factory()
+
+    doc_agent = DocumentUnderstandingAgent(provider_factory=provider_factory, trace_sink=trace_sink)
     document_structure = doc_agent.run(run_id, docx_path)
 
-    excel_agent = ExcelUnderstandingAgent(trace_sink=trace_sink, max_workers=10)
+    excel_agent = ExcelUnderstandingAgent(provider_factory=provider_factory, trace_sink=trace_sink, max_workers=10)
     workbook_inventory = excel_agent.run(run_id, excel_dir)
 
-    topic_agent = TopicMappingAgent(trace_sink=trace_sink)
+    topic_agent = TopicMappingAgent(provider_factory=provider_factory, trace_sink=trace_sink)
     topic_mapping = topic_agent.run(run_id, document_structure, workbook_inventory)
 
-    planner = CalculationPlanningAgent(trace_sink=trace_sink)
+    planner = CalculationPlanningAgent(provider_factory=provider_factory, trace_sink=trace_sink)
     doc_topics = [t.model_dump(mode="json") for t in document_structure.topics]
     execution_plan = planner.run(run_id, doc_topics, workbook_inventory, topic_mapping, reporting_start, reporting_end)
 

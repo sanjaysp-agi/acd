@@ -48,6 +48,12 @@ class AgentStep:
     arguments: dict[str, Any] = field(default_factory=dict)
     rationale: str = ""
     final_output: dict[str, Any] | None = None
+    # Set by BedrockProvider from the real Converse API toolUse block it
+    # generated this step from (None for LocalDeterministicProvider steps,
+    # which never flow through Converse). Threading this through lets the
+    # NEXT turn be rebuilt as a real toolUse/toolResult pair instead of
+    # flattened text -- see llm.bedrock_provider._to_converse_messages.
+    tool_use_id: str | None = None
 
 
 class ToolCallingProvider(Protocol):

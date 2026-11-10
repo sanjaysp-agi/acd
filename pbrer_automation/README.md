@@ -16,28 +16,30 @@ cp .env.example .env   # defaults to local/deterministic mode; see "AWS Bedrock 
 ## Running the app
 
 ```bash
-streamlit run app.py
+uvicorn server.main:app --reload
 ```
 
 Open the printed local URL, go to **Upload Documents**, upload the previous/approved
 PBRER (.docx) and the current Excel exports (all-case, all-drug-event, and any
 topic-specific case/drug-event pairs), enter the reporting start/end dates, and click
 **Run pipeline**. A single run against the 10 real development files takes roughly
-3-5 minutes, dominated by the two large all-case/all-drug-event exports (28k/63k rows).
+3-5 minutes, dominated by the two large all-case/all-drug-event exports (28k/63k rows) --
+live per-agent progress streams to the page the whole time (see "Frontend: Streamlit ->
+React" below).
 
 ## Running tests
 
 ```bash
 pytest -m "not slow" -v     # 31 unit tests, ~7s, no real files required beyond the dev fixtures
-pytest -m slow -v           # full end-to-end + 22 headless frontend (AppTest) tests against real files
+pytest -m slow -v           # full end-to-end pipeline reproduction against real files
 ```
 
-**Test results (this environment):** 31/31 fast tests pass; 23/23 slow tests pass (1 full
-pipeline reproduction + 22 headless `streamlit.testing.v1.AppTest` page checks -- see
-"Independent audit and remediation pass" below). The `slow` end-to-end test reproduces
-every benchmark figure in Part 6 of the original spec exactly (see below). After the first
-run, the file-hash analysis cache (`llm/cache.py:AnalysisCache`) makes repeat slow runs
-against the same fixtures finish in under a minute instead of ~4 minutes.
+**Test results (this environment):** 31/31 fast tests pass; 1/1 slow test passes (full
+pipeline reproduction -- see "Independent audit and remediation pass" below for what it
+originally caught). The `slow` end-to-end test reproduces every benchmark figure in Part 6
+of the original spec exactly (see below). After the first run, the file-hash analysis cache
+(`llm/cache.py:AnalysisCache`) makes repeat slow runs against the same fixtures finish in
+under a minute instead of ~4 minutes.
 
 ---
 
@@ -55,7 +57,7 @@ against the same fixtures finish in under a minute instead of ~4 minutes.
 | Validation & reconciliation | ✅ `validation/` -- all 14 mandatory checks from Part 5 now formalized as `ValidationCheckResult`s in a single `ValidationReport` (`validation/input_validator.py`, `validation/mapping_validator.py`, `validation/calculation_validator.py`) |
 | AWS Bedrock integration | ⚠️ implemented, **not verified live** -- see below |
 | Cost controls / LLM-call caching | ✅ implemented; `llm/cache.py:AnalysisCache` now actually caches Document/Excel Agent analysis by file hash (cost-control item 6), and `PBRER_MAX_TOOL_ITERATIONS` is now wired into every agent instead of being dead config |
-| Streamlit frontend, 10 pages | ✅ all 10 pages implemented and headlessly tested (`streamlit.testing.v1.AppTest`, `tests/test_frontend_pages.py`), incl. manual topic-mapping correction/approval (`st.data_editor` + re-run) |
+| React frontend (buildless, no npm), 10 pages + Run History | ✅ FastAPI + vendored React 18/htm, no bundler -- see "Frontend: Streamlit -> React" below; incl. manual topic-mapping correction/approval + re-run |
 | Live Agent Execution & Traceability page | ✅ reads real persisted tool-call events, never simulated |
 | Persisted structured execution logs | ✅ `observability/trace_store.py`, one JSONL per run |
 | Calculation results / audit / report-ready / benchmark workbooks | ✅ `generation/` |
@@ -272,18 +274,49 @@ as a paraphrase-drift from memory, not ground truth.
   parse, which cut a single large-file pass from 60s+ to ~15s. A production version
   could cache a parsed-sheet object across calls within one workbook's investigation;
   not done here to keep each tool's contract (and its trace entry) fully independent.
-- **No browser was available to manually click through the UI.** All 10 Streamlit
-  pages were verified headlessly with `streamlit.testing.v1.AppTest` (both with no run
-  yet, and with a real completed pipeline result injected into session state) -- this
-  caught and fixed a real bug (the benchmark-workbook generator crashing on dict-valued
-  metrics). A manual browser click-through is still recommended before sign-off.
+- **No browser was available to manually click through the React UI either.** The
+  backend (every `/api/runs/...` endpoint, including a full 10-file real-fixture run,
+  the topic-mapping recompute endpoint, and all 4 downloads) was verified end-to-end
+  with real HTTP requests against the real `input/` fixtures. The frontend's JS was
+  syntax-checked (`node --check` against each module) and every static asset path was
+  verified to resolve (200, correct `text/javascript` MIME type) against a running
+  server, but `playwright install chromium` failed in this environment (the corporate
+  network's TLS-intercepting proxy rejects `cdn.playwright.dev`'s certificate chain --
+  the same category of restriction that motivated vendoring React/htm locally instead
+  of loading them from a CDN at runtime). A manual browser click-through is still
+  recommended before sign-off.
 
-## Minor known cosmetic issue
+## Frontend: Streamlit -> React (buildless, no npm)
 
-The Validation & Audit page's benchmark table mixes scalar and stringified
-dict/list values in one column; pyarrow logs a conversion warning and Streamlit
-auto-recovers (confirmed via `AppTest`: page still renders with no exception). Not
-fixed further since it's display-only and doesn't affect any calculated figure.
+The original Streamlit frontend was replaced with React, without installing Node/npm
+(disallowed by company policy) and without any bundler/build step:
+
+- **Backend**: FastAPI (`server/`), installed via `pip install fastapi` --
+  `uvicorn`/`starlette`/`python-multipart`/`anyio` were already present as transitive
+  deps. One process (`uvicorn server.main:app`) serves both the JSON API under `/api`
+  and the static frontend (`web/`).
+- **Frontend**: React 18 + `htm` (JSX-free "tagged template" markup), loaded as plain
+  UMD `<script>` tags vendored into `web/vendor/` -- no `node_modules`, no JSX
+  compilation step. Works identically online or fully air-gapped.
+- **Run execution is now async**: `POST /api/runs` returns immediately with a `run_id`;
+  the pipeline runs on a background thread. `GET /api/runs/{id}/events` streams live
+  trace events over Server-Sent Events (the browser's built-in `EventSource`, no
+  library) so the Upload page shows real per-agent progress instead of one blocking
+  3-5 minute spinner.
+- **Full run persistence**: previously only a thin summary JSON survived a run,
+  everything else lived only in the Streamlit session's memory. `observability/run_store.py`
+  now persists every stage's full Pydantic output to `data/runs/{run_id}/result.json`
+  and rehydrates it back into typed models on load -- this is what makes the new
+  **Run History** page possible (reload any past run, not just the one just computed).
+- `pipeline.recompute_from_topic_mapping` (lifted out of the old Streamlit page,
+  behavior unchanged) backs the Topic Mapping page's manual correction/re-run flow.
+- Two small UX additions fell out of rebuilding the UI anyway: a searchable filter on
+  the Traceability page's live/historical event log, and color-coded row highlighting
+  (not just a status badge) on the Validation page's benchmark comparison table.
+- Deliberately **not** done as part of this migration (each is a standalone feature on
+  top of the now-React app, not required for Streamlit->React parity): per-file upload
+  validation feedback, an audit/e-signature trail for manual approvals, a single
+  zip-bundle download, auth/roles, or an admin UI for `config/metric_registry.py`.
 
 ## Project structure
 
@@ -291,4 +324,7 @@ See `pipeline.py` for the single entry point tying all five stages together
 (Document Agent → Excel Agent → Topic Mapping Agent → Calculation Planning Agent →
 deterministic calculation engine → validation/benchmark). Directory layout follows
 the standard structure (`config/`, `agents/`, `tools/`, `llm/`, `processing/`,
-`validation/`, `observability/`, `generation/`, `models/`, `frontend/`, `tests/`).
+`validation/`, `observability/`, `generation/`, `models/`, `tests/`), plus two
+frontend-facing additions from the React migration: `server/` (FastAPI app + routers)
+and `web/` (the buildless React frontend: vendored React/htm, hand-written CSS, and
+one `.js` module per page/component -- see "Frontend: Streamlit -> React" above).

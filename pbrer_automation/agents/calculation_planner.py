@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 
-from agents.base import ToolCallingAgent
+from agents.base import ToolCallingAgent, last_tool_result
 from config.metric_registry import CanonicalField, DataGrain
 from llm.local_provider import LocalDeterministicProvider
 from llm.provider import AgentStep, ToolSpec
@@ -21,15 +21,23 @@ from models.schemas import AgentWarning, ExecutionPlan, ExecutionPlanStep, Topic
 from tools import plan_tools as pt
 
 
-def build_plan_tool_specs() -> list[ToolSpec]:
+def build_plan_tool_specs(document_topics: list[dict], workbook_entries: list[dict], topic_mappings: list[dict],
+                           reporting_start: str, reporting_end: str) -> list[ToolSpec]:
+    """Real arguments bound via closure -- see topic_mapping_agent.
+    build_topic_tool_specs for why: a model-driven provider only decides
+    to call this tool, never retypes the full workbook_entries/
+    topic_mappings arrays itself. agents.base.last_tool_result reads the
+    real output back out afterward."""
+    def _run(**_ignored_model_arguments):
+        return pt.build_execution_plan(document_topics, workbook_entries, topic_mappings,
+                                        reporting_start, reporting_end)
+
     return [
         ToolSpec("build_execution_plan",
-                 "Assemble validated execution plan steps from workbook inventory + topic mappings.",
-                 {"type": "object", "properties": {
-                     "document_topics": {"type": "array"}, "workbook_entries": {"type": "array"},
-                     "topic_mappings": {"type": "array"}, "reporting_start": {"type": "string"},
-                     "reporting_end": {"type": "string"}}},
-                 pt.build_execution_plan, "python"),
+                 "Assemble validated execution plan steps from workbook inventory + topic mappings. "
+                 "Takes no arguments -- the data is already loaded; just call it.",
+                 {"type": "object", "properties": {}},
+                 _run, "python"),
     ]
 
 
@@ -37,7 +45,8 @@ PLANNER_SYSTEM_PROMPT = (
     "You are the Calculation Planning Agent. Assemble an execution plan using "
     "ONLY the approved metric registry and already-validated column mappings. "
     "Never invent a business rule or generate calculation code -- mark a step "
-    "unvalidated if required fields are missing rather than guessing."
+    "unvalidated if required fields are missing rather than guessing. Call "
+    "build_execution_plan (it needs no arguments) to get the real plan, then finish."
 )
 
 
@@ -47,7 +56,6 @@ class CalculationPlanningAgent:
     def __init__(self, provider_factory=None, trace_sink=None, max_iterations: int | None = None):
         from config.settings import settings
 
-        self.tool_specs = build_plan_tool_specs()
         self.trace_sink = trace_sink
         self.max_iterations = max_iterations if max_iterations is not None else settings.llm.max_tool_iterations
         self._provider_factory = provider_factory
@@ -62,22 +70,20 @@ class CalculationPlanningAgent:
         def policy(conversation, tools):
             if state["phase"] == "start":
                 state["phase"] = "done"
-                return AgentStep(type="call_tool", tool_name="build_execution_plan",
-                                  arguments={"document_topics": document_topics, "workbook_entries": workbook_entries,
-                                             "topic_mappings": topic_mappings, "reporting_start": reporting_start,
-                                             "reporting_end": reporting_end},
+                return AgentStep(type="call_tool", tool_name="build_execution_plan", arguments={},
                                   rationale="Assembling execution plan from validated inventory + topic mappings.")
-            last_turn = conversation[-1] if conversation else {}
-            return AgentStep(type="final", final_output={"plan_result": last_turn.get("structured")})
+            return AgentStep(type="final", final_output={})
 
         provider = (self._provider_factory(policy) if self._provider_factory
                     else LocalDeterministicProvider(policy))
-        runner = ToolCallingAgent(provider, self.tool_specs, max_iterations=self.max_iterations,
+        tool_specs = build_plan_tool_specs(document_topics, workbook_entries, topic_mappings,
+                                            reporting_start, reporting_end)
+        runner = ToolCallingAgent(provider, tool_specs, max_iterations=self.max_iterations,
                                    trace_sink=self.trace_sink)
         runner.agent_name = self.agent_name
         result = runner.run(run_id, PLANNER_SYSTEM_PROMPT, "Build the Section 16.3 execution plan.")
 
-        plan_result = result.output.get("plan_result") or {"steps": [], "warnings": []}
+        plan_result = last_tool_result(result, "build_execution_plan") or {"steps": [], "warnings": []}
         steps = []
         for s in plan_result.get("steps", []):
             steps.append(ExecutionPlanStep(

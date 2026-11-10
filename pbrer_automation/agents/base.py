@@ -97,7 +97,17 @@ class ToolCallingAgent:
                 )
                 result.warnings.append(warning)
                 self._emit(run_id, "warning", message=warning.message, status="warning")
-                conversation.append({"role": "assistant", "content": f"[invalid tool request: {step.tool_name}]"})
+                # Shaped like a real tool-result turn (same tool_use_id the
+                # model's own toolUse block carried) so Converse-native
+                # providers can reply with a matching toolResult instead of
+                # leaving a dangling toolUse with no response.
+                conversation.append({
+                    "role": "user",
+                    "content": f"[invalid tool request: {step.tool_name}]",
+                    "tool_use_id": step.tool_use_id,
+                    "tool_name": step.tool_name,
+                    "error": f"Unknown tool '{step.tool_name}'",
+                })
                 continue
 
             started = time.monotonic()
@@ -117,7 +127,7 @@ class ToolCallingAgent:
                 library=tool.library,
                 arguments_redacted=self._redact(step.arguments),
                 result_summary=result_summary,
-                raw_result=tool_result if isinstance(tool_result, dict) else {"value": tool_result},
+                raw_result=tool_result,
                 timestamp=datetime.now(UTC),
                 duration_ms=round(duration_ms, 2),
             )
@@ -129,19 +139,36 @@ class ToolCallingAgent:
                 status="error" if error else "success",
             )
 
+            # `arguments`/`tool_use_id` here (not just the display `content`
+            # string) let a Converse-native provider rebuild its OWN prior
+            # toolUse block verbatim on the next call -- see
+            # llm.bedrock_provider._to_converse_messages. Real (unredacted)
+            # arguments, since this is reconstructing what the model itself
+            # already generated, not a new disclosure.
             conversation.append(
                 {
                     "role": "assistant",
                     "content": f"Called {tool.name}({json.dumps(self._redact(step.arguments))})",
+                    "tool_name": tool.name,
+                    "arguments": step.arguments,
+                    "tool_use_id": step.tool_use_id,
                 }
             )
+            # `content` here -- NOT `result_summary` -- is what a real model
+            # actually sees in the next turn (see llm.bedrock_provider), so it
+            # must carry the real tool output, not the 220-char trace preview;
+            # a model reasoning over a truncated preview can't make correct
+            # follow-up decisions (which sheet to inspect next, which columns
+            # map to what). `result_summary` stays short -- it's only for the
+            # traceability UI.
             conversation.append(
                 {
                     "role": "user",
-                    "content": f"Tool result: {result_summary}",
+                    "content": f"Tool result: {_full_result_text(tool_result, error)}",
                     "structured": tool_result,
                     "tool_name": tool.name,
                     "error": error,
+                    "tool_use_id": step.tool_use_id,
                 }
             )
 
@@ -156,9 +183,47 @@ class ToolCallingAgent:
         return result
 
 
+def last_tool_result(result: AgentRunResult, tool_name: str) -> dict[str, Any] | None:
+    """Returns the real, uncorrupted output of the most recent successful
+    call to `tool_name`, straight from the actual Python tool execution --
+    never whatever a model-driven provider claims in its own final text.
+    A real model asked to retype a large structured tool result into its
+    final answer risks truncating or mangling it; agents whose only real
+    job is "call this one deterministic tool and report its output
+    unchanged" (topic mapping, calculation planning) should prefer this
+    over `result.output`."""
+    for record in reversed(result.tool_calls):
+        if record.tool_name == tool_name and not record.result_summary.startswith("ERROR:"):
+            return record.raw_result
+    return None
+
+
 def _summarize(value: Any, max_len: int = 220) -> str:
     try:
         text = json.dumps(value, default=str)
     except TypeError:
         text = str(value)
     return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+# Cap well above _summarize's trace-display length (a real model needs the
+# actual tool output to reason over) but still bounded, so one huge sheet
+# dump can't blow the whole conversation's token budget. Empirically, a
+# single detect_headings call on a real ~1700-block PBRER document alone
+# serializes to ~18k chars -- a smaller cap silently truncates mid-JSON,
+# handing the model an unparseable fragment it then can't faithfully copy
+# into its next tool call (observed as the model dropping/mangling that
+# argument entirely on every retry).
+_MAX_CONVERSATION_RESULT_CHARS = 100_000
+
+
+def _full_result_text(value: Any, error: str | None) -> str:
+    if error:
+        return f"ERROR: {error}"
+    try:
+        text = json.dumps(value, default=str)
+    except TypeError:
+        text = str(value)
+    if len(text) <= _MAX_CONVERSATION_RESULT_CHARS:
+        return text
+    return text[:_MAX_CONVERSATION_RESULT_CHARS] + f"... [truncated, {len(text)} chars total]"

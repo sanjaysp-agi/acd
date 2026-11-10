@@ -23,7 +23,10 @@ class ToolCallRecord(BaseModel):
     library: str
     arguments_redacted: dict[str, Any] = Field(default_factory=dict)
     result_summary: str
-    raw_result: dict[str, Any] | None = None
+    # The tool's actual return value, unwrapped -- many predefined tools
+    # return a list (e.g. reconstruct_section_numbers, map_columns_to_schema),
+    # not just a dict, so this can't be typed dict-only.
+    raw_result: Any | None = None
     timestamp: datetime | None = None
     duration_ms: float | None = None
 

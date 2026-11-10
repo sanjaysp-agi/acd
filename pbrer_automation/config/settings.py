@@ -44,8 +44,11 @@ class LLMSettings:
     provider: str = os.environ.get("PBRER_LLM_PROVIDER", "local")  # "local" | "bedrock"
     aws_profile: str | None = os.environ.get("AWS_PROFILE")
     aws_region: str = os.environ.get("AWS_REGION", "eu-west-1")
+    # Cross-region inference profile ID, not a plain on-demand model ID --
+    # newer Claude models on Bedrock are only available this way in most
+    # accounts (confirmed via `aws bedrock list-inference-profiles`).
     bedrock_model_id: str = os.environ.get(
-        "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"
+        "BEDROCK_MODEL_ID", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
     )
     # Safety ceiling on tool-calling round trips within a SINGLE agent run
     # (prompt.md Part 8) -- not a tight per-run budget (that's
@@ -55,7 +58,14 @@ class LLMSettings:
     # runaway tool-calling loop terminates rather than running unbounded.
     max_tool_iterations: int = _env_int("PBRER_MAX_TOOL_ITERATIONS", 200)
     max_invocations_per_run: int = _env_int("PBRER_MAX_INVOCATIONS_PER_RUN", 40)
-    max_output_tokens: int = _env_int("PBRER_MAX_OUTPUT_TOKENS", 2048)
+    # Document/Excel Agent tool chains routinely need the model to echo a
+    # prior tool result's array back as the NEXT tool call's argument (e.g.
+    # detect_headings' full heading list into exclude_front_matter_headings).
+    # Confirmed empirically: a real ~1700-block PBRER document's 124
+    # headings alone need ~5000 output tokens to round-trip; the old 2048
+    # default silently truncated generation mid-tool-call, leaving an
+    # empty/unusable argument with no error raised anywhere.
+    max_output_tokens: int = _env_int("PBRER_MAX_OUTPUT_TOKENS", 16000)
     temperature: float = 0.0
     enable_cache: bool = _env_bool("PBRER_ENABLE_LLM_CACHE", True)
 
