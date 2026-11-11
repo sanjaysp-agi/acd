@@ -163,7 +163,10 @@ class BedrockProvider:
 
         messages = self._to_converse_messages(conversation)
         tool_names = [t.name for t in tools]
-        generation_config = {"max_output_tokens": self.max_output_tokens, "temperature": settings.llm.temperature}
+        # No "temperature" key: newer Bedrock Claude models (e.g. Sonnet 5)
+        # reject it outright -- "`temperature` is deprecated for this
+        # model" -- even when set to the SDK's own default value.
+        generation_config = {"max_output_tokens": self.max_output_tokens}
 
         if self.cache is not None:
             cached = self.cache.get(self.model_id, system_prompt, conversation, tool_names, generation_config)
@@ -177,7 +180,7 @@ class BedrockProvider:
                 system=[{"text": system_prompt}],
                 messages=messages,
                 toolConfig=self._tool_config(tools),
-                inferenceConfig={"maxTokens": self.max_output_tokens, "temperature": settings.llm.temperature},
+                inferenceConfig={"maxTokens": self.max_output_tokens},
             )
         except Exception as exc:  # noqa: BLE001 -- surfaced to caller, never swallowed/retried silently
             raise BedrockInvocationError(f"Bedrock Converse call failed: {exc}") from exc

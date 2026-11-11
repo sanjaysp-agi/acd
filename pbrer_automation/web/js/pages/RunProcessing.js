@@ -89,7 +89,7 @@ export default function RunProcessing({ pendingRunId, runId, setRunId, setPendin
     </div>
 
     <div class="card">
-      ${status === "running" && html`<p><span class="spinner"></span>Processing -- this typically takes 3-5 minutes.</p>`}
+      ${status === "running" && html`<p><span class="spinner"></span>Processing -- this typically takes 15-20 minutes.</p>`}
       ${status === "completed" && html`
         <p>Processing complete. ${pendingRunId ? "" : "(Showing the last completed run.)"}</p>
         <button class="btn" onClick=${() => { setPendingRunId(null); navigate("Review & Validation"); }}>Review results</button>

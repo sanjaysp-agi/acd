@@ -6,6 +6,7 @@ reflects the real run order from prompt.md Part 10.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
@@ -394,11 +395,21 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
         from llm.factory import build_provider_factory
         provider_factory = build_provider_factory()
 
+    # Document Agent and Excel Agent read disjoint inputs (the .docx vs. the
+    # Excel files) and neither depends on the other's output -- only Topic
+    # Mapping Agent (next) needs both. Running them concurrently drops this
+    # stage from doc_time + excel_time to max(doc_time, excel_time); the
+    # trace store is already lock-protected (observability/trace_store.py)
+    # since Excel Agent's own internal per-workbook fan-out already writes
+    # to it from multiple threads.
     doc_agent = DocumentUnderstandingAgent(provider_factory=provider_factory, trace_sink=trace_sink)
-    document_structure = doc_agent.run(run_id, docx_path)
-
     excel_agent = ExcelUnderstandingAgent(provider_factory=provider_factory, trace_sink=trace_sink, max_workers=10)
-    workbook_inventory = excel_agent.run(run_id, excel_dir)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        doc_future = pool.submit(doc_agent.run, run_id, docx_path)
+        excel_future = pool.submit(excel_agent.run, run_id, excel_dir)
+        document_structure = doc_future.result()
+        workbook_inventory = excel_future.result()
 
     topic_agent = TopicMappingAgent(provider_factory=provider_factory, trace_sink=trace_sink)
     topic_mapping = topic_agent.run(run_id, document_structure, workbook_inventory)

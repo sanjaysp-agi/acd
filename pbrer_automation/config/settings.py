@@ -10,8 +10,24 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, field
 
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Explicit path, not the default search-upward behavior: this repo's .env
+# lives in the project root, but uvicorn's cwd isn't guaranteed to be there.
+# Real environment variables (e.g. already-exported AWS creds) still win --
+# load_dotenv() never overrides an existing os.environ entry.
+load_dotenv(PROJECT_ROOT / ".env")
+
+# AWS_PROFILE= (blank, meaning "no profile") is valid in .env, but boto3
+# reads AWS_PROFILE straight from os.environ itself -- a blank string isn't
+# "unset" to boto3, it tries to load a profile literally named "" and fails
+# with "The config profile () could not be found". Strip it so an empty
+# value behaves like the var was never set.
+if not os.environ.get("AWS_PROFILE"):
+    os.environ.pop("AWS_PROFILE", None)
+
 DATA_DIR = PROJECT_ROOT / "data"
 INPUT_DIR = DATA_DIR / "input"
 CACHE_DIR = DATA_DIR / "cache"
