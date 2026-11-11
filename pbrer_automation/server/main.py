@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from server.routers import downloads, runs, topic_mapping, trace
+from server.routers import comments, downloads, runs, topic_mapping, trace
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -28,5 +28,6 @@ app.include_router(runs.router)
 app.include_router(trace.router)
 app.include_router(topic_mapping.router)
 app.include_router(downloads.router)
+app.include_router(comments.router)
 
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")

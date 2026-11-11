@@ -16,6 +16,7 @@ from typing import Any
 
 from config.settings import RUNS_DIR
 from models.schemas import (
+    AIScoreReport,
     BenchmarkReport,
     DocumentStructure,
     ExecutionPlan,
@@ -29,7 +30,11 @@ from models.schemas import (
 
 # Single-model fields vs. list-of-model fields -- everything else in the
 # result dict (run_id, generated_at, _excel_dir) is already a plain
-# JSON-safe scalar.
+# JSON-safe scalar. Every new top-level Pydantic-model field added to
+# pipeline.run_full_pipeline's return dict MUST be registered here too --
+# save_result() only calls .model_dump() for keys listed in one of these
+# two maps; anything else is assumed to already be JSON-safe and handed
+# straight to json.dumps(), which raises TypeError for an un-dumped model.
 _MODEL_FIELDS = {
     "document_structure": DocumentStructure,
     "workbook_inventory": WorkbookInventory,
@@ -37,6 +42,7 @@ _MODEL_FIELDS = {
     "execution_plan": ExecutionPlan,
     "benchmark_report": BenchmarkReport,
     "validation_report": ValidationReport,
+    "ai_score_report": AIScoreReport,
 }
 _LIST_MODEL_FIELDS = {
     "metric_results": MetricResult,

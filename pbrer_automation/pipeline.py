@@ -10,6 +10,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
+from agents.ai_scoring_agent import AIScoreAgent
 from agents.calculation_planner import CalculationPlanningAgent
 from agents.document_agent import DocumentUnderstandingAgent
 from agents.excel_agent import ExcelUnderstandingAgent
@@ -17,6 +18,7 @@ from agents.extraction_review_agent import ExtractionReviewAgent
 from agents.topic_mapping_agent import TopicMappingAgent
 from config.metric_registry import CanonicalField, WorkbookType
 from models.schemas import (
+    AIScoreReport,
     DocumentStructure,
     ExecutionPlan,
     ExtractionReviewFinding,
@@ -48,6 +50,18 @@ def run_extraction_review(run_id: str, document_structure: DocumentStructure, wo
     being able to fail the run itself -- see _review_findings_to_checks."""
     agent = ExtractionReviewAgent(provider_factory=provider_factory, trace_sink=trace_sink)
     return agent.run(run_id, document_structure, workbook_inventory, metric_results)
+
+
+def run_ai_scoring(run_id: str, document_structure: DocumentStructure, metric_results: list[MetricResult],
+                     provider_factory=None, trace_sink=None) -> AIScoreReport:
+    """AI-assisted confidence scoring (see agents.ai_scoring_agent). Must be
+    called strictly AFTER validation.calculation_validator.build_metric_result
+    and validation.reconciliation.build_benchmark_report have already run --
+    every score is grounded in the validation_status/historical_value those
+    steps already attached to each MetricResult, never guessed ahead of
+    them."""
+    agent = AIScoreAgent(provider_factory=provider_factory, trace_sink=trace_sink)
+    return agent.run(run_id, document_structure, metric_results)
 
 
 def _review_findings_to_checks(findings: list[ExtractionReviewFinding]) -> list[ValidationCheckResult]:
@@ -109,12 +123,18 @@ def recompute_from_topic_mapping(result: dict[str, Any], new_mapping: TopicMappi
     extra_checks.extend(_review_findings_to_checks(review_findings))
     validation_report = assemble_validation_report(run_id, metric_results, extra_checks)
 
+    # AI scoring runs strictly AFTER the validation report above -- see
+    # run_ai_scoring's docstring.
+    ai_score_report = run_ai_scoring(run_id, document_structure, metric_results,
+                                       provider_factory=build_provider_factory())
+
     result = dict(result)
     result.update({
         "topic_mapping": new_mapping, "execution_plan": execution_plan, "metric_results": metric_results,
         "benchmark_report": benchmark_report, "topic_reconstruction": reconstruction_results,
         "extraction_review": review_findings,
-        "validation_report": validation_report, "generated_at": datetime.now(UTC),
+        "validation_report": validation_report, "ai_score_report": ai_score_report,
+        "generated_at": datetime.now(UTC),
     })
     return result
 
@@ -414,6 +434,13 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
 
     validation_report = assemble_validation_report(run_id, metric_results, extra_checks)
 
+    # AI scoring runs strictly AFTER the validation report above -- see
+    # run_ai_scoring's docstring. Shares the same provider_factory as every
+    # other agent in this run, so PBRER_LLM_PROVIDER=bedrock routes this
+    # scoring step through a real Bedrock model too.
+    ai_score_report = run_ai_scoring(run_id, document_structure, metric_results,
+                                       provider_factory=provider_factory, trace_sink=trace_sink)
+
     return {
         "run_id": run_id,
         "generated_at": datetime.now(UTC),
@@ -426,6 +453,7 @@ def run_full_pipeline(run_id: str, docx_path: str | Path, excel_dir: str | Path,
         "topic_reconstruction": reconstruction_results,
         "extraction_review": review_findings,
         "validation_report": validation_report,
+        "ai_score_report": ai_score_report,
         # Retained so the frontend can re-run just the planning/calculation
         # stages (e.g. after a manual topic-mapping correction) without
         # re-running the Document/Excel Understanding Agents.

@@ -49,17 +49,28 @@ def _bind_file_path(fn, real_path: str):
     return wrapped
 
 
+# The library label is only shown in the traceability UI (never sent to
+# the model -- see ToolSpec.library / agents.base.ToolCallRecord), but a
+# tool bound to a REAL file path genuinely dispatches to a different
+# library depending on that file's actual format (tools.document_tools._load_blocks).
+# Hardcoding "python-docx" here regardless of format previously made every
+# .pdf/.txt run's trace claim python-docx was used -- actively misleading
+# when debugging a format-specific extraction difference.
+_LIBRARY_BY_SUFFIX = {".docx": "python-docx", ".pdf": "pdfplumber", ".txt": "python (stdlib)"}
+
+
 def build_document_tool_specs(file_path: str) -> list[ToolSpec]:
+    file_library = _LIBRARY_BY_SUFFIX.get(Path(file_path).suffix.lower(), "python")
     return [
         ToolSpec("inspect_document_metadata", "Report paragraph/table counts and style usage.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
-                 _bind_file_path(dtools.inspect_document_metadata, file_path), "python-docx"),
+                 _bind_file_path(dtools.inspect_document_metadata, file_path), file_library),
         ToolSpec("sample_paragraph_styles", "Sample text per distinct paragraph style.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
-                 _bind_file_path(dtools.sample_paragraph_styles, file_path), "python-docx"),
+                 _bind_file_path(dtools.sample_paragraph_styles, file_path), file_library),
         ToolSpec("detect_headings", "Detect headings via style-name/outline-level/bold heuristics.",
                  {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
-                 _bind_file_path(dtools.detect_headings, file_path), "python-docx"),
+                 _bind_file_path(dtools.detect_headings, file_path), file_library),
         ToolSpec("exclude_front_matter_headings", "Drop leading unnumbered front-matter headings.",
                  {"type": "object", "properties": {"headings": {"type": "array"}}, "required": ["headings"]},
                  dtools.exclude_front_matter_headings, "python"),
@@ -76,7 +87,7 @@ def build_document_tool_specs(file_path: str) -> list[ToolSpec]:
                                                      "target_heading_text": {"type": "string"},
                                                      "target_relative_number": {"type": "string"}},
                   "required": ["file_path", "target_heading_text", "target_relative_number"]},
-                 _bind_file_path(dtools.calibrate_section_numbers, file_path), "python-docx"),
+                 _bind_file_path(dtools.calibrate_section_numbers, file_path), file_library),
         ToolSpec("extract_topic_subtree", "Get all descendant headings of the target section.",
                  {"type": "object", "properties": {"headings_with_numbers": {"type": "array"},
                                                      "target_block_index": {"type": "integer"}},
@@ -87,7 +98,7 @@ def build_document_tool_specs(file_path: str) -> list[ToolSpec]:
                                                      "heading_block_index": {"type": "integer"},
                                                      "next_heading_block_index": {"type": ["integer", "null"]}},
                   "required": ["file_path", "heading_block_index", "next_heading_block_index"]},
-                 _bind_file_path(dtools.extract_tables_near_heading, file_path), "python-docx"),
+                 _bind_file_path(dtools.extract_tables_near_heading, file_path), file_library),
         ToolSpec("parse_topic_historical_metrics", "Extract structured numbers from a topic's table/paragraphs.",
                  {"type": "object", "properties": {"table_rows": {"type": "array"}, "paragraphs": {"type": "array"}},
                   "required": ["table_rows", "paragraphs"]},

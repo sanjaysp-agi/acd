@@ -273,6 +273,44 @@ class ExtractionReviewFinding(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# AI Score Validation Agent output (runs AFTER the deterministic
+# validation/benchmark steps -- see agents.ai_scoring_agent /
+# validation.calculation_validator / validation.reconciliation). Assigns a
+# 0.0-1.0 confidence score to every calculated metric reflecting how well
+# the available evidence actually supports it, and always backs that score
+# with a citation to where the evidence came from, so the score itself is
+# checkable by a reviewer instead of an opaque number.
+# ---------------------------------------------------------------------------
+class AIScoreCitation(BaseModel):
+    source_type: Literal["document", "workbook", "none"] = "none"
+    document_section_number: str | None = None
+    document_section_title: str | None = None
+    source_workbook: str | None = None
+    source_sheet: str | None = None
+    detail: str = ""
+
+
+class AIScoreResult(BaseModel):
+    metric_id: str
+    pbrer_section_number: str | None
+    topic_heading: str
+    score: float = Field(ge=0.0, le=1.0)
+    # True only when `citation` actually points at a document section/table
+    # or source workbook/sheet -- see agents.ai_scoring_agent.build_scoring_tool_specs,
+    # which downgrades this to False if no real citation backs it.
+    present_in_source: bool
+    citation: AIScoreCitation
+    rationale: str = ""
+
+
+class AIScoreReport(BaseModel):
+    run_id: str
+    generated_at: datetime
+    mode: Literal["bedrock", "local_deterministic"] = "local_deterministic"
+    scores: list[AIScoreResult] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Independent topic reconstruction / cross-validation (prompt.md Part 2
 # Agent 3 lines 378-394; Part 5 mandatory check #13)
 # ---------------------------------------------------------------------------

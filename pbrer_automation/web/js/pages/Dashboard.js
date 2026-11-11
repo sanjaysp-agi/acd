@@ -1,52 +1,68 @@
 import { html } from "../html.js";
 import { useRun } from "../useRun.js";
 import Spinner from "../components/Spinner.js";
-import Banner, { NoRunBanner } from "../components/Banner.js";
+import Banner from "../components/Banner.js";
+import StatCard from "../components/StatCard.js";
+import StatusPill from "../components/StatusPill.js";
+import {
+  documentsUploaded, safetyTopicsExtracted, tablesGenerated,
+  validationSuccessPct, pendingReviewCount,
+} from "../lib/businessMetrics.js";
 
-export default function Dashboard({ runId, refreshKey }) {
+export default function Dashboard({ runId, refreshKey, navigate }) {
   const { data, loading, error } = useRun(runId, refreshKey);
 
   return html`
-    <h2>PBRER Section 16.3 Automation</h2>
-    <p class="caption">AI-driven extraction, calculation and validation of Section 16.3 numerical figures.</p>
-    ${!runId && html`<${Banner} kind="info">No run yet. Go to <b>Upload Documents</b> to start.<//>`}
-    ${loading && html`<${Spinner} label="Loading run..." />`}
-    ${error && html`<${Banner} kind="error">${error}<//>`}
-    ${data && renderDashboard(data)}
-  `;
-}
-
-function renderDashboard(result) {
-  const doc = result.document_structure;
-  const inv = result.workbook_inventory;
-  const mapping = result.topic_mapping;
-  const bench = result.benchmark_report;
-  const topicsMapped = mapping.mappings.filter((m) => m.case_workbook).length;
-  const matches = bench.rows.filter((r) => r.status === "match").length;
-  const mismatches = bench.rows.filter((r) => r.status === "mismatch").length;
-
-  return html`
-    <h3>Latest run: <code>${result.run_id}</code></h3>
-    <p class="caption">Generated at ${result.generated_at}</p>
-
-    <div class="card-row">
-      <div class="stat"><div class="label">Topics detected</div><div class="value">${doc.topics.length}</div></div>
-      <div class="stat"><div class="label">Workbooks discovered</div><div class="value">${inv.workbooks.length}</div></div>
-      <div class="stat"><div class="label">Topics mapped</div><div class="value">${topicsMapped}</div></div>
-      <div class="stat">
-        <div class="label">Benchmark matches</div>
-        <div class="value">${matches}${mismatches ? html` <span class="badge fail">-${mismatches} mismatch</span>` : ""}</div>
+    <div class="page-head">
+      <div>
+        <h2>Dashboard</h2>
+        <p class="caption">Overview of the latest Section 16.3 automation run.</p>
       </div>
     </div>
 
-    <h3>Reporting interval</h3>
-    <p><b>${result.execution_plan.reporting_start}</b> to <b>${result.execution_plan.reporting_end}</b> (both boundaries inclusive)</p>
+    ${!runId && html`
+      <${Banner} kind="info">
+        No run yet. Go to <a href="#" onClick=${(e) => { e.preventDefault(); navigate("Upload Sources"); }}>Upload Sources</a> to start one.
+      <//>
+    `}
+    ${loading && html`<${Spinner} label="Loading latest run..." />`}
+    ${error && html`<${Banner} kind="error">${error}<//>`}
+    ${data && renderDashboard(data, navigate)}
+  `;
+}
+
+function renderDashboard(result, navigate) {
+  const pending = pendingReviewCount(result);
+  const score = validationSuccessPct(result);
+  const plan = result.execution_plan;
+  const mapping = result.topic_mapping;
+
+  return html`
+    <div class="kpi-grid">
+      <${StatCard} label="Latest run status" value=${html`<${StatusPill} status="completed" />`} sub=${result.generated_at} />
+      <${StatCard} label="Reporting interval" value=${`${plan.reporting_start} – ${plan.reporting_end}`} sub="Both boundaries inclusive" />
+      <${StatCard} label="Documents uploaded" value=${documentsUploaded(result)} />
+      <${StatCard} label="Extracted safety topics" value=${safetyTopicsExtracted(result)} />
+      <${StatCard} label="Generated Section 16.3 tables" value=${tablesGenerated(result)} />
+      <${StatCard} label="Validation score" value=${score == null ? "N/A" : `${score}%`} />
+      <${StatCard}
+        label="Pending review items"
+        value=${pending}
+        sub=${pending > 0 ? html`<a href="#" onClick=${(e) => { e.preventDefault(); navigate("Review & Validation"); }}>Review now</a>` : "All clear"}
+      />
+    </div>
 
     ${mapping.unmatched_document_topics.length > 0 && html`
-      <${Banner} kind="warn">Topics with no matching Excel workbook: ${mapping.unmatched_document_topics.join(", ")}<//>
+      <${Banner} kind="warn">
+        ${mapping.unmatched_document_topics.length} safety topic(s) have no matching data source --
+        see <a href="#" onClick=${(e) => { e.preventDefault(); navigate("Review & Validation"); }}>Review & Validation<//> to resolve.
+      <//>
     `}
     ${mapping.unmatched_workbooks.length > 0 && html`
-      <${Banner} kind="warn">Workbooks with no matching PBRER topic: ${mapping.unmatched_workbooks.join(", ")}<//>
+      <${Banner} kind="warn">
+        ${mapping.unmatched_workbooks.length} uploaded data source(s) have no matching safety topic --
+        see <a href="#" onClick=${(e) => { e.preventDefault(); navigate("Review & Validation"); }}>Review & Validation<//> to resolve.
+      <//>
     `}
   `;
 }

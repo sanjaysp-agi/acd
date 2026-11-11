@@ -41,9 +41,10 @@ def _clamp_severity(value: str | None) -> str:
 
 
 def build_review_tool_specs(document_topics: list[dict], workbook_entries: list[dict],
-                              metric_results: list[dict]) -> list[ToolSpec]:
+                              metric_results: list[dict], heading_style_strategy: str | None = None) -> list[ToolSpec]:
     def _run_baseline(**_ignored_model_arguments):
-        return rt.check_extraction_completeness(document_topics, workbook_entries, metric_results)
+        return rt.check_extraction_completeness(document_topics, workbook_entries, metric_results,
+                                                  heading_style_strategy=heading_style_strategy)
 
     def _run_report(findings: list[dict] | None = None):
         findings = findings or []
@@ -131,7 +132,8 @@ class ExtractionReviewAgent:
 
         provider = (self._provider_factory(policy) if self._provider_factory
                     else LocalDeterministicProvider(policy))
-        tool_specs = build_review_tool_specs(document_topics, workbook_entries, metric_dicts)
+        tool_specs = build_review_tool_specs(document_topics, workbook_entries, metric_dicts,
+                                               heading_style_strategy=document_structure.heading_style_strategy)
         runner = ToolCallingAgent(provider, tool_specs, max_iterations=self.max_iterations,
                                    trace_sink=self.trace_sink)
         runner.agent_name = self.agent_name

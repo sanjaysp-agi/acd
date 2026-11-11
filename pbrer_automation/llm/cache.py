@@ -13,7 +13,21 @@ from typing import Any
 
 from config.settings import CACHE_DIR
 
-CONFIG_VERSION = "v1"
+# Bump whenever a detector/extraction code path changes in a way that
+# would make a previously-cached analysis stale even though the SOURCE
+# FILE's bytes didn't change. History:
+#   v2: tried a text-alignment table-detection fallback for borderless
+#       PDF tables in _load_pdf_blocks -- reverted (see that function's
+#       docstring) after it was found, against a real PBRER PDF, to
+#       misclassify a heading line as part of a false "table", regressing
+#       section detection. Superseded by v3; no code depends on v2 shape.
+#   v3: tools.document_tools._numbered_heading_headings gained a quality
+#       filter (_looks_like_real_heading) rejecting PDF line-wrap
+#       fragments that merely start with a digit (dosage figures,
+#       footnote/date citations, leaked table-row numbers) from being
+#       misdetected as section headings -- a PDF analyzed under v1/v2
+#       could have the wrong heading list entirely.
+CONFIG_VERSION = "v3"
 
 
 def _cache_key(model_id: str, system_prompt: str, conversation: list[dict[str, Any]], tool_names: list[str],

@@ -48,6 +48,20 @@ export function eventsUrl(runId) {
   return `${BASE}/${runId}/events`;
 }
 
+// artifact one of: calculation-results | audit-trail | report-ready |
+// benchmark-comparison | docx-report | audit-package
 export function downloadUrl(runId, artifact) {
   return `${BASE}/${runId}/downloads/${artifact}`;
+}
+
+export function listComments(runId) {
+  return fetch(`${BASE}/${runId}/comments`).then(asJson);
+}
+
+export function createComment(runId, { tableId, author, text }) {
+  return fetch(`${BASE}/${runId}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ table_id: tableId, author, text }),
+  }).then(asJson);
 }

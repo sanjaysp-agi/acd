@@ -11,6 +11,7 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font
 
+from generation.formatting import format_case_ratio
 from models.schemas import BenchmarkReport, MetricResult
 
 
@@ -50,11 +51,16 @@ def generate_report_ready_output(metric_results: list[MetricResult], output_path
         fatal = m.get("fatal_case_count")
         serious_pct = round(100 * serious / topic_count, 1) if serious is not None and topic_count else None
         fatal_pct = round(100 * fatal / topic_count, 1) if fatal is not None and topic_count else None
+        # Serious/Fatal Cases are always shown as "numerator/denominator"
+        # (e.g. "55/242") against the topic's own case count, not a bare
+        # number -- see generation.formatting.format_case_ratio.
+        serious_display = format_case_ratio("serious_case_count", serious, m)
+        fatal_display = format_case_ratio("fatal_case_count", fatal, m)
         ws.append([
             section, entry["heading"], topic_count,
             next((v for k, v in breakdown.items() if "spontaneous" in str(k).lower()), None),
             next((v for k, v in breakdown.items() if "other" in str(k).lower()), None),
-            serious, serious_pct, fatal, fatal_pct,
+            serious_display, serious_pct, fatal_display, fatal_pct,
         ])
 
     for col_cells in ws.columns:

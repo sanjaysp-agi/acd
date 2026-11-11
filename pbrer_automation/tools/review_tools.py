@@ -16,10 +16,22 @@ from typing import Any
 
 from config.metric_registry import METRIC_REGISTRY
 
+# Heading-detection strategies that do NOT rely on real paragraph-level
+# structure (python-docx style names / outlineLvl) -- the numbered-heading
+# and docx style_name/outline_level strategies are strong, format-backed
+# signals; font_size_heuristic (.pdf) and bold_heuristic/all_caps_heuristic
+# (.docx/.txt last resorts) are visual guesses with materially weaker
+# precision, and a PDF export in particular loses paragraph style metadata
+# entirely on conversion from Word. A document extracted under one of
+# these is more likely to have missed a table/section than one extracted
+# under a format-backed strategy.
+_WEAKER_HEADING_STRATEGIES = {"font_size_heuristic", "bold_heuristic", "all_caps_heuristic"}
+
 
 def check_extraction_completeness(document_topics: list[dict[str, Any]],
                                     workbook_entries: list[dict[str, Any]],
-                                    metric_results: list[dict[str, Any]]) -> dict[str, Any]:
+                                    metric_results: list[dict[str, Any]],
+                                    heading_style_strategy: str | None = None) -> dict[str, Any]:
     """Flags three independent classes of "extraction may have missed
     something": a topic whose historical PBRER figures imply a metric that
     never got calculated; a canonical field no uploaded workbook ever
@@ -27,8 +39,18 @@ def check_extraction_completeness(document_topics: list[dict[str, Any]],
     workbook that was discovered but never resolved to a usable type.
     Every finding is advisory (severity 'info' or 'warning', never
     'critical') -- this review informs a human reviewer, it never blocks
-    the pipeline on its own."""
+    the pipeline on its own.
+
+    `heading_style_strategy` (DocumentStructure.heading_style_strategy) is
+    used only to decide whether a "no table rows extracted" finding is
+    worth a 'warning' instead of a quiet 'info': under a weaker,
+    non-format-backed heading strategy (see _WEAKER_HEADING_STRATEGIES)
+    that same finding is much more likely to mean "extraction actually
+    failed" than "this topic genuinely has no table" -- never escalates
+    anything else, and never fabricates a finding that the deterministic
+    checks below didn't already produce."""
     findings: list[dict[str, Any]] = []
+    uses_weaker_strategy = heading_style_strategy in _WEAKER_HEADING_STRATEGIES
 
     metric_ids_by_section: dict[str | None, set[str]] = {}
     for mr in metric_results:
@@ -62,11 +84,22 @@ def check_extraction_completeness(document_topics: list[dict[str, Any]],
                            "count for the current period.",
             })
         if not topic.get("raw_table_rows"):
-            findings.append({
-                "severity": "info", "pbrer_section_number": section, "topic_heading": title,
-                "message": f"No data table rows were extracted near '{title}' in the source document -- "
-                           "its historical figures may be incomplete.",
-            })
+            if uses_weaker_strategy:
+                findings.append({
+                    "severity": "warning", "pbrer_section_number": section, "topic_heading": title,
+                    "message": f"No data table rows were extracted near '{title}' in the source document, AND "
+                               f"the document's headings were detected via the weaker '{heading_style_strategy}' "
+                               "strategy (common for PDF/scanned input, which loses Word's real paragraph-style "
+                               "metadata) -- this combination is a much stronger signal of a genuine extraction "
+                               "problem than a missing table alone. Re-check this topic's source document "
+                               "against the original .docx if available.",
+                })
+            else:
+                findings.append({
+                    "severity": "info", "pbrer_section_number": section, "topic_heading": title,
+                    "message": f"No data table rows were extracted near '{title}' in the source document -- "
+                               "its historical figures may be incomplete.",
+                })
 
     required_fields = {f.value for m in METRIC_REGISTRY.values() for f in m.required_fields}
     mapped_fields = {

@@ -171,6 +171,26 @@ def _line_font_size(words: list[dict[str, Any]]) -> float | None:
     return Counter(sizes).most_common(1)[0][0]
 
 
+def _find_tables_on_page(page):
+    """pdfplumber's default table-detection strategy ("lines") requires
+    VISIBLE ruling lines on the rendered page, so a borderless/layout-only
+    Word table (common for the label/value tables this template uses)
+    can silently find zero tables on a page that genuinely has one --
+    see _load_pdf_blocks' docstring. A whitespace/text-alignment fallback
+    strategy was tried here and reverted: against a real PBRER PDF export
+    (ticket: PDF re-upload of the Sifrol PBRER losing most of
+    Section 16.3) it was confirmed, empirically, to be too aggressive --
+    it misidentified a page's own HEADING line as part of a false-
+    positive "table" on an otherwise plain-text page, which silently
+    removed that heading from the paragraph stream and broke target-
+    section location entirely (0 topics found, vs. 1 found without the
+    fallback). Left as a single default-strategy call, matching upstream
+    pdfplumber behavior, until a more targeted fallback (e.g. gated on
+    page content actually looking tabular) can be designed and validated
+    against a real multi-page PBRER PDF rather than guessed at."""
+    return page.find_tables()
+
+
 def _load_pdf_blocks(file_path: str | Path) -> list[dict[str, Any]]:
     """Build paragraph/table IR blocks per page, keeping tables roughly
     where they visually occur relative to the surrounding text the same
@@ -184,7 +204,7 @@ def _load_pdf_blocks(file_path: str | Path) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     with pdfplumber.open(str(file_path)) as pdf:
         for page in pdf.pages:
-            tables = page.find_tables()
+            tables = _find_tables_on_page(page)
             table_bboxes = [t.bbox for t in tables]
 
             words = page.extract_words(extra_attrs=["size", "fontname"])
@@ -328,6 +348,45 @@ _ORDINAL_TOKEN_PATTERN = re.compile(
 )
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7}
 _NUMBERED_HEADING_PATTERN = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,4})\.?\s+\S")
+# Two classes of false positive confirmed against a real PBRER PDF export
+# (ticket: PDF re-upload of the Sifrol PBRER found only 1 of 7 expected
+# topics): ordinary body prose that happens to start with a number
+# (dosage figures like "2.25 mg, or 3.15 mg...", case-count sentences
+# like "14 ICSRs were retrieved...") and footnote/date-citation text
+# (e.g. a footnote numeral followed by "Jan 2023 (NDA 020667)..."). This
+# false-positive risk is specific to PDF's line-level text reconstruction
+# (`_group_words_into_lines`), which -- unlike python-docx's real
+# paragraph objects -- treats every visually-wrapped line as its own
+# candidate, so a sentence's own line-wrap boundary can coincidentally
+# start with a number. DOCX paragraphs are never split this way, so
+# these filters should never reject a genuine docx heading; both are
+# validated against the real failing PDF below.
+_LEADING_MONTH_DATE_PATTERN = re.compile(
+    r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}\b"
+)
+_DIGITS_ONLY_FRAGMENT_PATTERN = re.compile(r"^[\d\s.,%\-\u2013\u2014()/]+$")
+
+
+def _looks_like_real_heading(title_text: str, level: int) -> bool:
+    """Quality gate applied to every numbered_heading candidate (on top
+    of the length cap already applied by the caller): a real section
+    title in this template convention is always a short, capitalized
+    phrase -- never a lowercase sentence continuation, a footnote/date
+    citation, or a bare digit/punctuation fragment left over from an
+    undetected data table row."""
+    if not title_text or title_text[0].islower():
+        return False
+    if _LEADING_MONTH_DATE_PATTERN.match(title_text):
+        return False
+    # Bare, undotted numbers (level 1) are legitimately how this
+    # document's top-level chapters are typed ("1 INTRODUCTION", "2
+    # WORLDWIDE MARKETING AUTHORISATION STATUS", ...), so level alone
+    # can't be the filter -- only reject a level-1 candidate whose
+    # remaining text has no actual letters at all (a leaked table-row/
+    # page-number fragment like "14", "74", "\u2013 20 0 0").
+    if level == 1 and _DIGITS_ONLY_FRAGMENT_PATTERN.match(title_text):
+        return False
+    return True
 _MAX_HEADING_TEXT_LENGTH = 150
 
 
@@ -367,6 +426,8 @@ def _numbered_heading_headings(paragraphs: list[tuple[int, dict[str, Any]]]) -> 
         # prefix, once as the reconstructed section_number) wherever a
         # topic's title is displayed.
         title_text = text[m.end(1):].lstrip(". ").strip() or text
+        if not _looks_like_real_heading(title_text, level):
+            continue
         candidates.append({
             "block_index": block_idx,
             "text": title_text,
